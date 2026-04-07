@@ -66,16 +66,18 @@ def lookup_user_by_email(email: str) -> dict:
     Returns an empty dict if the user is not found.
     """
     user_info = client.get_user(email=email)
+    logger.info(f"Lookup for email '{email}' returned: {user_info}")
     if user_info is None:
         # TODO: prompt user to search by orcid
         return {}
 
     user_name = f"{user_info['first_name']} {user_info['last_name']}"
-
+    logger.info(f"User name for email '{email}' is: {user_name}")
     # TODO: internal research formatting
     projects = client.list_projects(user_info['orcid'])
     project_ids = [x['project_id'] for x in projects]
     project_ids.sort()
+    logger.info(f"Projects for email '{email}' are: {project_ids}")
     return {'name': user_name,
             'orcid': user_info['orcid'],
             'projects': project_ids}

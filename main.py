@@ -75,9 +75,12 @@ def user_lookup():
         return jsonify({"error": "email required"}), 400
     try:
         result = backend.lookup_user_by_email(email)
+        backend.logger.info(f"Lookup for email '{email}' returned: {result}")
     except Exception as e:
+        backend.logger.error(e)
         return jsonify({"error": str(e)}), 500
     if not result:
+        backend.logger.info(f"No user found for email '{email}'")
         return jsonify({"error": f"No user found for '{email}'"}), 404
     return jsonify(result)
 
