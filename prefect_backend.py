@@ -8,6 +8,8 @@ import subprocess as sp
 from crucible import CrucibleClient
 from crucible.models import BaseDataset
 import logging
+import asyncio
+from prefect import flow, task
 
 logger = logging.getLogger(__name__)
 
@@ -138,13 +140,20 @@ def print_sample_barcode(sample_unique_id, sample_name):
     return
 
 
-
 def get_emi_file_name(serfile: str) -> str:
     no_ext = serfile.split(".ser")[0]
     no_rep = re.sub('_[0-9]*$', '', no_ext)
     return f"{no_rep}.emi"
 
+def check_session_depth(session_folder_path: str, min_depth: int = 3) -> None:
+    parts = Path(session_folder_path).resolve().parts
+    if len(parts) - 1 <min_depth:  # subtract 1 to not count the root
+        raise ValueError(f"Session folder is too close to the filesystem root. Please select a folder at least {min_depth} levels deep.")
+    else:
+        return
 
+
+@task
 def create_session(session_folder_path: str, kw_list: list[str], comments: str, orcid: str,
                    project_id: str, instrument_name: str, sample_unique_id: str | None = None) -> tuple[str, str]:
     project_id = project_id.replace('Internal Research (', '').replace(')', '').strip()
@@ -166,7 +175,7 @@ def create_session(session_folder_path: str, kw_list: list[str], comments: str, 
                                       dataset_id=sess_dsid)
     return session_name, sess_dsid
 
-
+@task
 def identify_session_files(session_folder_path: str) -> list[str]:
     # TODO: use Path.rglob for recursive discovery
     acceptable_suffixes = {'.emd', '.dm3', '.dm4', '.bcf', '.ser', '.mcr', '.h5'}
@@ -179,6 +188,7 @@ def identify_session_files(session_folder_path: str) -> list[str]:
     ]
 
 
+@task
 def copy_all_files_to_gdrive(session_folder_path: str, instrument_name: str) -> None:
     p = Path(session_folder_path)
     relative_folder_path = p.relative_to(p.anchor).as_posix()
@@ -191,6 +201,7 @@ def copy_all_files_to_gdrive(session_folder_path: str, instrument_name: str) -> 
         logger.error(f'rclone copy for {session_folder_path} to google drive failed with error {e}')
 
 
+@task
 def copy_dataset_to_cloud(file: str, instrument_name: str, storage_bucket: str = 'crucible-uploads',
                           rclone_mount: str = 'mf-cloud-storage') -> list[str]:
     p = Path(file)
@@ -207,93 +218,137 @@ def copy_dataset_to_cloud(file: str, instrument_name: str, storage_bucket: str =
         cloud_rel_path = f"{instrument_name}/{local_rel_path}"
         rclone_dest = f'{rclone_mount}:{storage_bucket}/{cloud_rel_path}'
         dry_run = True if i == 0 else False  # only do dry run for the first file to check for errors before copying all files
-        run_rclone_command(local_file_path, rclone_dest, 'copy', background=True, checkflag=True, dry_run = dry_run)
+        run_rclone_command(local_file_path, rclone_dest, 'copy', background=False, checkflag=True, dry_run = dry_run)
         
         cloud_files.append(f'{cloud_rel_path}/{lp.name}')
 
     return cloud_files
 
 
-def upload_dataset(file: str, instrument_name: str, project_id: str, orcid: str,
-                      session_name: str=None, session_dsid: str = None, sample_unique_id: str=None,
-                      kw_list: list[str] = [], comments: str = None) -> str:
-    # copy the files to temp bucket
-    cloud_files = copy_dataset_to_cloud(file, instrument_name)
-
-    # create the dataset
-    ds = BaseDataset(file_to_upload=cloud_files[0],
-                     owner_orcid=orcid,
-                     project_id=project_id,
-                     instrument_name=instrument_name,
-                     session_name=session_name)
+@task
+def create_sql_record_for_dataset(cloud_files: list[str], instrument_name: str | None = None, project_id: str | None = None, orcid: str | None = None, session_name: str | None = None, kw_list: list[str] = [], comments: str | None = None):
+# create the dataset
+    ds_kwargs = {k: v for k, v in dict(
+        file_to_upload=cloud_files[0],
+        owner_orcid=orcid,
+        project_id=project_id,
+        instrument_name=instrument_name,
+        session_name=session_name,
+    ).items() if v is not None}
+    ds = BaseDataset(**ds_kwargs)
 
     scimd = {'comments': comments}  # TODO: ADD CLAUDE API CALL
     new_ds = client.datasets.create(ds, scientific_metadata=scimd, keywords=kw_list)
 
     new_ds_dsid = new_ds['created_record']['unique_id']
-    client.datasets.request_ingestion(new_ds_dsid, ingestion_class=None)
-
-    if session_dsid is not None:
-        client.datasets.link_parent_child(parent_dataset_id=session_dsid, child_dataset_id=new_ds_dsid)
-    if sample_unique_id is not None:
-        client.samples.add_to_dataset(dataset_id = new_ds_dsid, sample_id = sample_unique_id)
-
     return new_ds_dsid
 
 
-# def upload_session(
-#     orcid: str,
-#     project_id: str,
-#     instrument_name: str,
-#     sample_unique_id: str,
-#     session_folder_path: str,
-#     kw_list: list[str] = [],
-#     comments: str = '',
-# ) -> bool:
-#     """
-#     Run the upload with the collected form data.
-
-#     Returns True on success, False on failure.
-#     """
-#     # Guard against uploading from high-level directories (e.g. "/" or "D:\")
-#     MIN_DEPTH = 3  # require at least 3 levels below root
-#     parts = Path(session_folder_path).resolve().parts
-#     if len(parts) - 1 < MIN_DEPTH:
-#         raise ValueError(
-#             f"Session folder '{session_folder_path}' is too close to the filesystem root. "
-#             f"Please select a more specific folder (at least {MIN_DEPTH} levels deep)."
-#         )
-
-#     # Copy the files to google drive
-#     try:
-#         copy_all_files_to_gdrive(session_folder_path, instrument_name)
-#     except Exception as e:
-#         logger.error(e)
-
-#     # Identify session_files for Crucible
-#     session_files = identify_session_files(session_folder_path)
-
-#     # Create a session dataset in Crucible
-#     try:
-#         session_name, session_id = create_session(session_folder_path,
-#                                                    kw_list,
-#                                                    comments,
-#                                                    orcid,
-#                                                    project_id,
-#                                                    instrument_name,
-#                                                    sample_unique_id)
-#     except Exception as e:
-#         logger.error(e)
-#         return
+@task
+def run_data_ingestion(new_ds_dsid, ingestion_class: str | None = None):
+    ingestion_status = client.datasets.request_ingestion(new_ds_dsid, ingestion_class=ingestion_class, wait_for_response=True)
+    if ingestion_status['status'] != 'complete':
+        logger.error(f'Ingestion failed for dataset {new_ds_dsid} with status {ingestion_status}')
+        raise RuntimeError(f'Ingestion failed for dataset {new_ds_dsid} with status {ingestion_status}')
     
-#     # process each file as dataset
-#     for file in session_files:
-#         try:
-#             process_each_file(file, instrument_name, project_id, orcid,
-#                               session_name, session_id, sample_unique_id, kw_list, comments)
-#         except Exception as e:
-#             msg = f'Crucible upload failed for {file} with error {e}'
-#             logger.error(msg)
-#             raise Exception(msg)
+    return ingestion_status['status']
 
-#     return session_id
+
+@task
+def link_dataset_to_session(new_ds_dsid: str, session_dsid: str | None = None):
+    if session_dsid is not None:
+        response = client.datasets.link_parent_child(parent_dataset_id=session_dsid, child_dataset_id=new_ds_dsid)
+        return response
+    return None
+
+
+@task
+def link_dataset_and_sample(new_ds_dsid: str, sample_unique_id: str | None = None):
+    if sample_unique_id is not None:
+        response = client.samples.add_to_dataset(dataset_id = new_ds_dsid, sample_id = sample_unique_id)
+        return response
+    return None
+
+@task
+def request_insitu_aggregation(new_ds_dsid: str, ingestion_status: str):
+    response = client.datasets.request_insitu_aggregation(new_ds_dsid)
+    return response
+
+
+RESULTS_DIR = Path(".flow_results")
+RESULTS_DIR.mkdir(exist_ok=True)
+
+
+def _save_flow_result(dsid: str):
+    from prefect.runtime import flow_run
+    (RESULTS_DIR / str(flow_run.id)).write_text(dsid)
+
+
+def _run_name(prefix):
+    def generate():
+        from prefect.runtime import flow_run
+        return f"{prefix}-{Path(flow_run.parameters['file']).name}"
+    return generate
+
+
+@flow(flow_run_name=_run_name("insitu-upload"), persist_result=True)
+def insitu_upload(file: str, instrument_name: str, project_id: str, orcid: str, sample_unique_id: str | None = None, kw_list: list[str] = [], comments: str | None = None) -> str:
+    # copy the files to temp bucket
+    cloud_files = copy_dataset_to_cloud(file, instrument_name)
+
+    # create the dataset
+    new_ds_dsid = create_sql_record_for_dataset(cloud_files, None, project_id, orcid, kw_list=kw_list, comments=comments)
+
+    # request ingestion
+    ingestion_status = run_data_ingestion(new_ds_dsid, ingestion_class=None)
+
+    # check about linking to session and sample
+    # session_link_status = link_dataset_to_session(new_ds_dsid, session_dsid)
+    # sample_link_status = link_dataset_and_sample(new_ds_dsid, sample_unique_id)
+
+    # request post processing
+    aggregation_status = request_insitu_aggregation(new_ds_dsid, ingestion_status)
+    _save_flow_result(new_ds_dsid)
+    return new_ds_dsid
+
+
+@flow(flow_run_name=_run_name("upload"))
+def upload_child_dataset(file: str, instrument_name: str, project_id: str, orcid: str,
+                         session_name: str, session_dsid: str,
+                         sample_unique_id: str | None = None,
+                         kw_list: list[str] = [], comments: str | None = None) -> str:
+    cloud_files = copy_dataset_to_cloud(file, instrument_name)
+    new_ds_dsid = create_sql_record_for_dataset(cloud_files, instrument_name, project_id, orcid,
+                                 session_name=session_name, kw_list=kw_list, comments=comments)
+    run_data_ingestion(new_ds_dsid)
+    link_dataset_to_session(new_ds_dsid, session_dsid)
+    link_dataset_and_sample(new_ds_dsid, sample_unique_id)
+    return new_ds_dsid
+
+
+@flow(flow_run_name=_run_name("tem-session"), persist_result=True)
+async def tem_session_upload(file: str, instrument_name: str, project_id: str, orcid: str,
+                       sample_unique_id: str | None = None,
+                       kw_list: list[str] = [], comments: str | None = None) -> str:
+
+    session_folder_path = file
+
+    check_session_depth(session_folder_path)
+
+    copy_all_files_to_gdrive(session_folder_path, instrument_name)
+
+    session_name, session_dsid = create_session(
+        session_folder_path, kw_list, comments or "",
+        orcid, project_id, instrument_name, sample_unique_id)
+
+    session_files = identify_session_files(session_folder_path)
+
+    await asyncio.gather(*[
+        asyncio.to_thread(upload_child_dataset, f, instrument_name, project_id, orcid,
+                          session_name, session_dsid, sample_unique_id, kw_list, comments)
+        for f in session_files
+    ])
+
+    _save_flow_result(session_dsid)
+    return session_dsid
+

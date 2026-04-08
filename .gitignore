@@ -9,3 +9,13 @@ wheels/
 # Virtual environments
 .venv
 **.emd
+
+# test-data
+test-data/*
+
+# run info
+.env
+.flow_results
+
+# mac os
+.DS_Store

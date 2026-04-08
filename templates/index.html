@@ -180,9 +180,13 @@
               </div>
             </div>
           </div>
-          <!-- QR code section (hidden until success) -->
+          <!-- Links section (hidden until submission) -->
           <div id="qr-section" class="text-center mt-4 d-none">
             <p>
+              Monitor your data upload
+              <a id="prefect-link" href="#" target="_blank">here</a>.
+            </p>
+            <p class="d-none">
               View your data in
               <a id="crucible-link" href="#" target="_blank">Crucible</a>
               or scan the QR code below.
@@ -435,14 +439,13 @@
       clearStatus();
       resetUploadModal();
 
-      // Show the modal
+      // Show the modal with a spinner
       if (!uploadModal) {
         uploadModal = new bootstrap.Modal(document.getElementById("upload-modal"));
       }
       uploadModal.show();
-      setProgress(0, "Starting upload...");
+      setProgress(50, "Running upload flow...");
 
-      // POST with fetch, then read the SSE stream from the response body
       try {
         const res = await fetch("/api/upload", {
           method: "POST",
@@ -457,47 +460,27 @@
           }),
         });
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
+        const data = await res.json();
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
+        if (res.ok) {
+          setProgress(30, "Flow submitted, running...");
+          // Show Prefect monitoring link immediately
+          const prefectUrl = "http://127.0.0.1:4200/flow-runs/flow-run/" + data.flow_run_id;
+          document.getElementById("prefect-link").href = prefectUrl;
+          document.getElementById("qr-section").classList.remove("d-none");
+          document.getElementById("upload-modal-footer").classList.remove("d-none");
 
-          // Parse SSE messages from buffer
-          const parts = buffer.split("\n\n");
-          buffer = parts.pop(); // keep incomplete chunk
-          for (const part of parts) {
-            let eventType = "message";
-            let dataStr = "";
-            for (const line of part.split("\n")) {
-              if (line.startsWith("event: ")) eventType = line.slice(7);
-              else if (line.startsWith("data: ")) dataStr = line.slice(6);
-            }
-            if (!dataStr) continue;
-            const data = JSON.parse(dataStr);
-
-            if (eventType === "progress") {
-              setProgress(data.percent, data.message);
-            } else if (eventType === "complete") {
-              const bar = document.getElementById("progress-bar");
-              bar.classList.remove("progress-bar-striped", "progress-bar-animated");
-              bar.classList.add("bg-success");
-              setProgress(100, "Upload complete!");
-              showUploadSuccess(data.session_dsid, data.project_id);
-            } else if (eventType === "error") {
-              const bar = document.getElementById("progress-bar");
-              bar.classList.remove("progress-bar-striped", "progress-bar-animated");
-              bar.classList.add("bg-danger");
-              document.getElementById("progress-label").textContent = "Upload failed";
-              document.getElementById("upload-modal-title").textContent = "Upload Failed";
-              document.getElementById("upload-modal-header").classList.add("bg-danger", "text-white");
-              document.getElementById("upload-modal-footer").classList.remove("d-none");
-              showStatus(data.error, "danger");
-            }
-          }
+          // Poll for completion
+          pollFlowRun(data.flow_run_id, data.project_id);
+        } else {
+          const bar = document.getElementById("progress-bar");
+          bar.classList.remove("progress-bar-striped", "progress-bar-animated");
+          bar.classList.add("bg-danger");
+          document.getElementById("progress-label").textContent = "Upload failed";
+          document.getElementById("upload-modal-title").textContent = "Upload Failed";
+          document.getElementById("upload-modal-header").classList.add("bg-danger", "text-white");
+          document.getElementById("upload-modal-footer").classList.remove("d-none");
+          showStatus(data.error || "Unknown error", "danger");
         }
       } catch (e) {
         showStatus("Upload error: " + e.message, "danger");
@@ -509,25 +492,51 @@
     }
 
     // -------------------------------------------------------------------------
-    // Show success state in upload modal (QR code)
+    // Poll flow run until complete, then show Crucible link + QR
     // -------------------------------------------------------------------------
-    function showUploadSuccess(sessionDsid, projectId) {
-      const baseUrl = "https://crucible-graph-explorer-776258882599.us-central1.run.app";
+    function pollFlowRun(flowRunId, projectId) {
+      const interval = setInterval(async () => {
+        try {
+          const res = await fetch("/api/flow-run/" + flowRunId);
+          const data = await res.json();
 
-      document.getElementById("upload-modal-title").textContent = "Upload Successful!";
-      document.getElementById("upload-modal-header").classList.add("bg-success", "text-white");
-      document.getElementById("upload-modal-footer").classList.remove("d-none");
+          if (data.status === "COMPLETED") {
+            clearInterval(interval);
+            const bar = document.getElementById("progress-bar");
+            bar.classList.remove("progress-bar-striped", "progress-bar-animated");
+            bar.classList.add("bg-success");
+            setProgress(100, "Upload complete!");
+            document.getElementById("upload-modal-title").textContent = "Upload Complete!";
+            document.getElementById("upload-modal-header").classList.add("bg-success", "text-white");
 
-      const datasetUrl = baseUrl + "/" + projectId + "/dataset/" + sessionDsid;
-      document.getElementById("crucible-link").href = datasetUrl;
-      const qrContainer = document.getElementById("qr-code");
-      qrContainer.innerHTML = "";
-      new QRCode(qrContainer, {
-        text: datasetUrl,
-        width: 256,
-        height: 256,
-      });
-      document.getElementById("qr-section").classList.remove("d-none");
+            // Show Crucible link + QR code
+            const sessionDsid = data.result;
+            if (sessionDsid && projectId) {
+              const crucibleBaseUrl = "https://crucible-graph-explorer-776258882599.us-central1.run.app";
+              const datasetUrl = crucibleBaseUrl + "/" + projectId + "/dataset/" + sessionDsid;
+              document.getElementById("crucible-link").href = datasetUrl;
+              document.getElementById("crucible-link").parentElement.classList.remove("d-none");
+              const qrContainer = document.getElementById("qr-code");
+              qrContainer.innerHTML = "";
+              new QRCode(qrContainer, { text: datasetUrl, width: 256, height: 256 });
+            }
+          } else if (data.status === "FAILED" || data.status === "CRASHED" || data.status === "CANCELLED") {
+            clearInterval(interval);
+            const bar = document.getElementById("progress-bar");
+            bar.classList.remove("progress-bar-striped", "progress-bar-animated");
+            bar.classList.add("bg-danger");
+            document.getElementById("progress-label").textContent = "Upload failed";
+            document.getElementById("upload-modal-title").textContent = "Upload Failed";
+            document.getElementById("upload-modal-header").classList.add("bg-danger", "text-white");
+            showStatus("Flow run failed. Check the Prefect UI for details.", "danger");
+          } else {
+            // Still running — update progress label
+            setProgress(50, "Running: " + (data.name || "processing..."));
+          }
+        } catch (e) {
+          // Polling error — keep trying
+        }
+      }, 5000);
     }
 
     // -------------------------------------------------------------------------

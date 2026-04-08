@@ -1,0 +1,14 @@
+"""
+Registers Prefect flows as deployments and serves them.
+
+Usage:
+    export PREFECT_API_URL=http://127.0.0.1:4200/api
+    python serve_flows.py
+"""
+from prefect import serve
+from prefect_backend import insitu_upload, tem_session_upload
+
+if __name__ == "__main__":
+    insitu_deploy = insitu_upload.to_deployment(name="insitu-upload")
+    tem_deploy = tem_session_upload.to_deployment(name="tem-session-upload")
+    serve(insitu_deploy, tem_deploy)
