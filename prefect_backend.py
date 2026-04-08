@@ -327,9 +327,11 @@ def upload_child_dataset(file: str, instrument_name: str, project_id: str, orcid
 
 
 @flow(flow_run_name=_run_name("tem-session"), persist_result=True)
-async def tem_session_upload(file: str, instrument_name: str, project_id: str, orcid: str,
+def tem_session_upload(file: str, instrument_name: str, project_id: str, orcid: str,
                        sample_unique_id: str | None = None,
                        kw_list: list[str] = [], comments: str | None = None) -> str:
+    import time
+    from prefect.deployments import run_deployment
 
     session_folder_path = file
 
@@ -343,11 +345,50 @@ async def tem_session_upload(file: str, instrument_name: str, project_id: str, o
 
     session_files = identify_session_files(session_folder_path)
 
-    await asyncio.gather(*[
-        asyncio.to_thread(upload_child_dataset, f, instrument_name, project_id, orcid,
-                          session_name, session_dsid, sample_unique_id, kw_list, comments)
-        for f in session_files
-    ])
+    # Submit all child flows in parallel (timeout=0 returns immediately)
+    child_runs = []
+    for f in session_files:
+        run = run_deployment(
+            "upload-child-dataset/upload-child-dataset",
+            parameters={
+                "file": f,
+                "instrument_name": instrument_name,
+                "project_id": project_id,
+                "orcid": orcid,
+                "session_name": session_name,
+                "session_dsid": session_dsid,
+                "sample_unique_id": sample_unique_id,
+                "kw_list": kw_list,
+                "comments": comments,
+            },
+            timeout=0,
+        )
+        child_runs.append(run)
+        logger.info(f"Submitted child flow for {Path(f).name}: {run.id}")
+
+    # Wait for all children to reach a terminal state
+    terminal_states = {"COMPLETED", "FAILED", "CRASHED", "CANCELLED"}
+    pending = {str(r.id) for r in child_runs}
+    failed = []
+
+    while pending:
+        time.sleep(5)
+        still_pending = set()
+        for rid in pending:
+            import requests as req
+            import os
+            api_url = os.environ.get("PREFECT_API_URL", "http://127.0.0.1:4200/api")
+            resp = req.get(f"{api_url}/flow_runs/{rid}")
+            state = resp.json().get("state", {}).get("type", "")
+            if state not in terminal_states:
+                still_pending.add(rid)
+            elif state != "COMPLETED":
+                failed.append(rid)
+                logger.error(f"Child flow run {rid} ended with state {state}")
+        pending = still_pending
+
+    if failed:
+        logger.error(f"{len(failed)} child flow(s) failed. Retry them from the Prefect UI.")
 
     _save_flow_result(session_dsid)
     return session_dsid
