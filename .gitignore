@@ -23,4 +23,5 @@ mf-crucible-*.json
 rclone/**
 *.code-workspace
 *.txy
-*instrument_conf.py
+instrument_conf.py
+*_instrument_conf.py

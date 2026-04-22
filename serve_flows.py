@@ -5,6 +5,9 @@ Usage:
     export PREFECT_API_URL=http://127.0.0.1:4200/api
     python serve_flows.py
 """
+import os
+os.environ['PREFECT_API_DATABASE_TIMEOUT'] = '30.0'
+
 from prefect import serve
 from prefect_backend import run_shell, insitu_upload, tem_session_upload, upload_child_dataset
 
