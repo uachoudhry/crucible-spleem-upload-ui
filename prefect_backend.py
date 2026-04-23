@@ -198,7 +198,7 @@ def check_existing_sessions(session_folder_path: str, orcid: str, project_id: st
     ]
 
 
-@task
+@task(retries=3, retry_delay_seconds=5)
 def create_session(session_folder_path: str, kw_list: list[str], comments: str, orcid: str,
                    project_id: str, instrument_name: str, sample_unique_id: str | None = None,
                    session_dsid: str | None = None) -> tuple[str, str]:
@@ -238,7 +238,7 @@ def identify_session_files(session_folder_path: str) -> list[str]:
     ]
 
 
-@task
+@task(retries=3, retry_delay_seconds=10)
 def copy_all_files_to_gdrive(session_folder_path: str, instrument_name: str) -> None:
     p = Path(session_folder_path)
     relative_folder_path = p.relative_to(p.anchor).as_posix()
@@ -251,7 +251,7 @@ def copy_all_files_to_gdrive(session_folder_path: str, instrument_name: str) -> 
         logger.error(f'rclone copy for {session_folder_path} to google drive failed with error {e}')
 
 
-@task
+@task(retries=3, retry_delay_seconds=10)
 def copy_dataset_to_cloud(file: str, instrument_name: str, storage_bucket: str = 'crucible-uploads',
                           rclone_mount: str = 'mf-cloud-storage') -> list[str]:
     p = Path(file)
@@ -275,7 +275,7 @@ def copy_dataset_to_cloud(file: str, instrument_name: str, storage_bucket: str =
     return cloud_files
 
 
-@task
+@task(retries=3, retry_delay_seconds=5)
 def create_sql_record_for_dataset(cloud_files: list[str], 
                                   instrument_name: str | None = None,
                                   project_id: str | None = None,
@@ -306,7 +306,7 @@ def create_sql_record_for_dataset(cloud_files: list[str],
     return new_ds_dsid
 
 
-@task
+@task(retries=3, retry_delay_seconds=5)
 def run_data_ingestion(new_ds_dsid, ingestion_class: str | None = None):
     ingestion_status = client.datasets.request_ingestion(new_ds_dsid, ingestion_class=ingestion_class, wait_for_response=True)
     if ingestion_status['status'] != 'complete':
@@ -316,7 +316,7 @@ def run_data_ingestion(new_ds_dsid, ingestion_class: str | None = None):
     return ingestion_status['status']
 
 
-@task
+@task(retries=3, retry_delay_seconds=5)
 def link_dataset_to_session(new_ds_dsid: str, session_dsid: str | None = None):
     if session_dsid is not None:
         response = client.datasets.link_parent_child(parent_dataset_id=session_dsid, child_dataset_id=new_ds_dsid)
@@ -324,14 +324,14 @@ def link_dataset_to_session(new_ds_dsid: str, session_dsid: str | None = None):
     return None
 
 
-@task
+@task(retries=3, retry_delay_seconds=5)
 def link_dataset_and_sample(new_ds_dsid: str, sample_unique_id: str | None = None):
     if sample_unique_id is not None:
         response = client.samples.add_to_dataset(dataset_id = new_ds_dsid, sample_id = sample_unique_id)
         return response
     return None
 
-@task
+@task(retries=3, retry_delay_seconds=5)
 def request_insitu_aggregation(new_ds_dsid: str, ingestion_status: str):
     response = client.datasets.request_insitu_aggregation(new_ds_dsid)
     return response
