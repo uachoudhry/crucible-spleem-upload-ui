@@ -1,16 +1,5 @@
-DEFAULT_BROWSE_DIR = "Z:\crucible-data"  # Set to a path like "/data/sessions" to default the file picker
-IS_SESSION = True # Set to False if the instrument doesn't have sessions, and files are uploaded directly as datasets
-INSTRUMENTS=["titanx", "themis", "team1",  "team05", 'spectre', "insitu_pl"] # you can add your instrument here
-DEFAULT_INSTRUMENT_NAME = 'titanx'
-PRINT_BARCODE_ENABLED = True 
-'''
-To enable barcode printing: 
-- set PRINT_BARCODE_ENABLED to True
-- Connect a brother pt-d610bt label printer to the computer running this code, and set the printer name in the print_label function in backend.py
-- Install the required libraries: uv add pywin32
-- Install printer driver from here: https://support.brother.com/g/b/downloadtop.aspx?c=us&lang=en&prod=d610bteus
-- Find the printer in settings under printers and scanners and note the exact name (e.g. "Brother PT-D610BT")
-- Download the brothers SDK for Windows B-pac (made a free account)
-- Set printer settings through windows to match the tape type and size that you want to print (https://docs.google.com/presentation/d/1vSS1Xp0fzIwflpj50vx5LOO9MuW7FtZhLS1EQ7D4opI/edit?usp=sharing)
-'''
-
+DEFAULT_BROWSE_DIR = ""  # Set to SPLEEM data directory, e.g. "G:\\Shared drives\\FeGd growth in SPLEEM\\Data"
+IS_SESSION = True  # Session folder → one parent dataset + child dataset per file
+INSTRUMENTS = ["qspleem_microscope"]  # Registered name in Crucible; update if renamed to 'qspleem'
+DEFAULT_INSTRUMENT_NAME = "qspleem_microscope"
+PRINT_BARCODE_ENABLED = False

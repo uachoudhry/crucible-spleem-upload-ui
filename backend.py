@@ -1,8 +1,7 @@
 """
-Backend functions for the Crucible upload UI.
-Replace these stubs with your real implementations.
+Backend functions for the Crucible SPLEEM upload UI.
+Adapted from crucible-tem-upload-ui for the SPLEEM microscope.
 """
-import re
 from pathlib import Path
 import subprocess as sp
 from crucible import CrucibleClient
@@ -127,22 +126,10 @@ def lookup_sample(sample_name: str | None = None, sample_unique_id: str | None =
         return {}
 
 
-def print_sample_barcode(sample_unique_id, sample_name):
-    from image_print import make_qr, make_nirvana_image, print_label
-    # qr code
-    qr_img = make_qr(sample_unique_id)
-
-    # label image
-    make_nirvana_image(qr_img, [sample_name, sample_unique_id[0:13]], "batch.png")
-    print_label("Brother PT-D610BT", "batch.png")
-    return
-
-
-
-def get_emi_file_name(serfile: str) -> str:
-    no_ext = serfile.split(".ser")[0]
-    no_rep = re.sub('_[0-9]*$', '', no_ext)
-    return f"{no_rep}.emi"
+def _rclone_available() -> bool:
+    """Return True if rclone is installed and reachable."""
+    result = sp.run("rclone version", shell=True, stdout=sp.PIPE, stderr=sp.STDOUT)
+    return result.returncode == 0
 
 
 def create_session(session_folder_path: str, kw_list: list[str], comments: str, orcid: str,
@@ -169,8 +156,8 @@ def create_session(session_folder_path: str, kw_list: list[str], comments: str, 
 
 def identify_session_files(session_folder_path: str) -> list[str]:
     # TODO: use Path.rglob for recursive discovery
-    acceptable_suffixes = {'.emd', '.dm3', '.dm4', '.bcf', '.ser', '.mcr', '.h5'}
-    max_size = 20 * 1024 ** 3  # 2 GiB
+    acceptable_suffixes = {'.h5', '.tif', '.tiff', '.png', '.jpg', '.jpeg', '.csv', '.txt'}
+    max_size = 20 * 1024 ** 3  # 20 GiB
     return [
         str(f) for f in Path(session_folder_path).iterdir()
         if f.is_file()
@@ -180,11 +167,14 @@ def identify_session_files(session_folder_path: str) -> list[str]:
 
 
 def copy_all_files_to_gdrive(session_folder_path: str, instrument_name: str) -> None:
+    if not _rclone_available():
+        logger.warning('rclone not found — skipping Google Drive backup. '
+                       'Install and configure rclone to enable cloud backup.')
+        return
     p = Path(session_folder_path)
     relative_folder_path = p.relative_to(p.anchor).as_posix()
     dest = f"{instrument_name}-gdrive:/crucible-uploads/{instrument_name}/{relative_folder_path}"
     logger.info(f'Copying {session_folder_path} to {dest}')
-    
     try:
         run_rclone_command(session_folder_path, dest, 'copy', background=True)
     except Exception as e:
@@ -193,35 +183,27 @@ def copy_all_files_to_gdrive(session_folder_path: str, instrument_name: str) -> 
 
 def copy_dataset_to_cloud(file: str, instrument_name: str, storage_bucket: str = 'crucible-uploads',
                           rclone_mount: str = 'mf-cloud-storage') -> list[str]:
+    if not _rclone_available():
+        logger.warning('rclone not found — skipping cloud storage copy. '
+                       'Install and configure rclone to enable cloud backup.')
+        return []
     p = Path(file)
-    ftype = p.suffix.lstrip('.')
-
-    # find any associated files
-    files_to_upload = [file, get_emi_file_name(file)] if ftype == 'ser' else [file]
-
-    # copy
-    cloud_files = []
-    for i, local_file_path in enumerate(files_to_upload):
-        lp = Path(local_file_path)
-        local_rel_path = lp.parent.relative_to(lp.parent.anchor).as_posix()
-        cloud_rel_path = f"{instrument_name}/{local_rel_path}"
-        rclone_dest = f'{rclone_mount}:{storage_bucket}/{cloud_rel_path}'
-        dry_run = True if i == 0 else False  # only do dry run for the first file to check for errors before copying all files
-        run_rclone_command(local_file_path, rclone_dest, 'copy', background=True, checkflag=True, dry_run = dry_run)
-        
-        cloud_files.append(f'{cloud_rel_path}/{lp.name}')
-
-    return cloud_files
+    lp = p
+    local_rel_path = lp.parent.relative_to(lp.parent.anchor).as_posix()
+    cloud_rel_path = f"{instrument_name}/{local_rel_path}"
+    rclone_dest = f'{rclone_mount}:{storage_bucket}/{cloud_rel_path}'
+    run_rclone_command(file, rclone_dest, 'copy', background=True, checkflag=True, dry_run=True)
+    return [f'{cloud_rel_path}/{lp.name}']
 
 
 def upload_dataset(file: str, instrument_name: str, project_id: str, orcid: str,
                       session_name: str=None, session_dsid: str = None, sample_unique_id: str=None,
                       kw_list: list[str] = [], comments: str = None) -> str:
-    # copy the files to temp bucket
+    # copy the files to temp bucket (skipped gracefully if rclone not configured)
     cloud_files = copy_dataset_to_cloud(file, instrument_name)
 
     # create the dataset
-    ds = BaseDataset(file_to_upload=cloud_files[0],
+    ds = BaseDataset(file_to_upload=cloud_files[0] if cloud_files else Path(file).name,
                      owner_orcid=orcid,
                      project_id=project_id,
                      instrument_name=instrument_name,

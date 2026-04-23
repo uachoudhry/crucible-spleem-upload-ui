@@ -106,19 +106,6 @@ def sample_lookup():
     return jsonify(result)
 
 
-@app.post("/api/sample/print-barcode")
-def print_barcode():
-    data = request.json or {}
-    sample_unique_id = data.get("sample_unique_id", "").strip()
-    sample_name = data.get("sample_name", "").strip()
-    if not sample_unique_id:
-        return jsonify({"error": "Missing sample_unique_id"}), 400
-    try:
-        backend.print_sample_barcode(sample_unique_id, sample_name)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    return jsonify({"ok": True})
-
 
 @app.post("/api/upload")
 def do_upload():
