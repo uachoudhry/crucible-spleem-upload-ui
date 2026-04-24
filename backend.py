@@ -187,8 +187,7 @@ def copy_dataset_to_cloud(file: str, instrument_name: str, storage_bucket: str =
         logger.warning('rclone not found — skipping cloud storage copy. '
                        'Install and configure rclone to enable cloud backup.')
         return []
-    p = Path(file)
-    lp = p
+    lp = Path(file)
     local_rel_path = lp.parent.relative_to(lp.parent.anchor).as_posix()
     cloud_rel_path = f"{instrument_name}/{local_rel_path}"
     rclone_dest = f'{rclone_mount}:{storage_bucket}/{cloud_rel_path}'
