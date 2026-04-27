@@ -186,12 +186,12 @@ def copy_dataset_to_cloud(file: str, instrument_name: str, storage_bucket: str =
     if not _rclone_available():
         logger.warning('rclone not found — skipping cloud storage copy. '
                        'Install and configure rclone to enable cloud backup.')
-        return []
+        return None
     lp = Path(file)
     local_rel_path = lp.parent.relative_to(lp.parent.anchor).as_posix()
     cloud_rel_path = f"{instrument_name}/{local_rel_path}"
     rclone_dest = f'{rclone_mount}:{storage_bucket}/{cloud_rel_path}'
-    run_rclone_command(file, rclone_dest, 'copy', background=True, checkflag=True, dry_run=True)
+    run_rclone_command(file, rclone_dest, 'copy', background=False, checkflag=True, dry_run=True)
     return [f'{cloud_rel_path}/{lp.name}']
 
 
@@ -202,17 +202,24 @@ def upload_dataset(file: str, instrument_name: str, project_id: str, orcid: str,
     cloud_files = copy_dataset_to_cloud(file, instrument_name)
 
     # create the dataset
-    ds = BaseDataset(file_to_upload=cloud_files[0] if cloud_files else Path(file).name,
+    ds = BaseDataset(file_to_upload=cloud_files[0] if cloud_files else None,
                      owner_orcid=orcid,
                      project_id=project_id,
                      instrument_name=instrument_name,
                      session_name=session_name)
 
     scimd = {'comments': comments}  # TODO: ADD CLAUDE API CALL
-    new_ds = client.datasets.create(ds, scientific_metadata=scimd, keywords=kw_list)
 
-    new_ds_dsid = new_ds['created_record']['unique_id']
-    client.datasets.request_ingestion(new_ds_dsid, ingestion_class=None)
+    if cloud_files:
+        # file already copied to cloud
+        new_ds = client.datasets.create(ds, scientific_metadata=scimd, keywords=kw_list)
+        new_ds_dsid = new_ds['created_record']['unique_id']
+        client.datasets.request_ingestion(new_ds_dsid, ingestion_class=None)
+    else:
+        # no rclone, direct upload
+        new_ds = client.datasets.create(ds, scientific_metadata=scimd, keywords=kw_list,
+                                        files_to_upload=[file])
+        new_ds_dsid = new_ds['created_record']['unique_id']
 
     if session_dsid is not None:
         client.datasets.link_parent_child(parent_dataset_id=session_dsid, child_dataset_id=new_ds_dsid)
