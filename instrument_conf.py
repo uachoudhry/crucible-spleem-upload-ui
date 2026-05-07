@@ -1,8 +1,16 @@
-DEFAULT_BROWSE_DIR = "Z:\crucible-data"  # Set to a path like "/data/sessions" to default the file picker
+DEFAULT_BROWSE_DIR = ""  # Set to a path like "/data/sessions" to default the file picker
 IS_SESSION = True # Set to False if the instrument doesn't have sessions, and files are uploaded directly as datasets
 INSTRUMENTS=["titanx", "themis", "team1",  "team05", 'spectre', "insitu_pl"] # you can add your instrument here
 DEFAULT_INSTRUMENT_NAME = 'titanx'
-PRINT_BARCODE_ENABLED = True 
+
+# Maps instrument names to their Prefect deployment name (flow-name/deployment-name)
+INSTRUMENT_FLOWS = {
+    "insitu_pl": "insitu-upload/insitu-upload",
+    "titanx": "tem-session-upload/tem-session-upload",  # add when ready
+}
+
+PRINT_BARCODE_ENABLED = False
+
 '''
 To enable barcode printing: 
 - set PRINT_BARCODE_ENABLED to True

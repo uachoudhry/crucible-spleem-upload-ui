@@ -9,3 +9,18 @@ wheels/
 # Virtual environments
 .venv
 **.emd
+
+# test-data
+test-data/*
+
+# run info
+.env
+.flow_results
+
+# other
+.DS_Store
+mf-crucible-*.json
+rclone/**
+*.code-workspace
+*.txy
+*_instrument_conf.py

@@ -180,9 +180,13 @@
               </div>
             </div>
           </div>
-          <!-- QR code section (hidden until success) -->
+          <!-- Links section (hidden until submission) -->
           <div id="qr-section" class="text-center mt-4 d-none">
             <p>
+              Monitor your data upload
+              <a id="prefect-link" href="#" target="_blank">here</a>.
+            </p>
+            <p class="d-none">
               View your data in
               <a id="crucible-link" href="#" target="_blank">Crucible</a>
               or scan the QR code below.
@@ -192,6 +196,61 @@
         </div>
         <div class="modal-footer d-none" id="upload-modal-footer">
           <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Select Session Modal -->
+  <div class="modal fade" id="select-session-modal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Select Existing Session</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small">Multiple sessions match this folder. Select which one to use, or create a new session.</p>
+          <div id="session-list" class="list-group mb-3"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-outline-primary" onclick="confirmSessionSelection(null)">Create New Session</button>
+          <button type="button" class="btn btn-primary" onclick="confirmSessionSelection()" id="btn-use-session">Use Selected</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Sample Modal -->
+  <div class="modal fade" id="create-sample-modal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Create New Sample</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small">No sample was found. Fill in the details below to create a new one.</p>
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Sample Name <span class="text-danger">*</span></label>
+            <input id="create-sample-name" type="text" class="form-control" />
+          </div>
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Sample Type</label>
+            <input id="create-sample-type" type="text" class="form-control" />
+          </div>
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Description</label>
+            <textarea id="create-sample-description" class="form-control" rows="2"></textarea>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-primary" onclick="submitCreateSample()">
+            <span id="spinner-create-sample" class="spinner-border spinner-border-sm d-none me-1" role="status"></span>
+            Create Sample
+          </button>
         </div>
       </div>
     </div>
@@ -320,10 +379,14 @@
         });
         const data = await res.json();
         if (!res.ok) {
-          alert("Sample not found");
-          document.getElementById("sample-name").value = "";
           document.getElementById("sample-uid").value = "";
           document.getElementById("description").value = "";
+          const searchedName = payload.sample_name || "";
+          document.getElementById("create-sample-name").value = searchedName;
+          document.getElementById("create-sample-type").value = "";
+          document.getElementById("create-sample-description").value = "";
+          const modal = new bootstrap.Modal(document.getElementById("create-sample-modal"));
+          modal.show();
           return;
         }
 
@@ -357,6 +420,45 @@
         if (!n && !u) document.getElementById("description").value = "";
       });
     });
+
+    // -------------------------------------------------------------------------
+    // Create Sample
+    // -------------------------------------------------------------------------
+    async function submitCreateSample() {
+      const sampleName = document.getElementById("create-sample-name").value.trim();
+      if (!sampleName) { showStatus("Sample name is required.", "warning"); return; }
+
+      const project = document.getElementById("project").value;
+      if (!project || !state.orcid) { showStatus("User and project must be selected first.", "warning"); return; }
+
+      document.getElementById("spinner-create-sample").classList.remove("d-none");
+
+      try {
+        const res = await fetch("/api/sample/create", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sample_name: sampleName,
+            sample_type: document.getElementById("create-sample-type").value.trim() || null,
+            description: document.getElementById("create-sample-description").value.trim() || null,
+            project_id: project,
+            owner_orcid: state.orcid,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) { showStatus(data.error || "Failed to create sample", "danger"); return; }
+
+        document.getElementById("sample-name").value = data.sample_name || "";
+        document.getElementById("sample-uid").value = data.unique_id || "";
+        document.getElementById("description").value = "";
+        bootstrap.Modal.getInstance(document.getElementById("create-sample-modal")).hide();
+        showStatus("Sample created successfully.", "success");
+      } catch (e) {
+        showStatus("Create sample failed: " + e.message, "danger");
+      } finally {
+        document.getElementById("spinner-create-sample").classList.add("d-none");
+      }
+    }
 
     // -------------------------------------------------------------------------
     // Print Sample Barcode
@@ -424,6 +526,29 @@
       document.getElementById("qr-code").innerHTML = "";
     }
 
+    let _pendingUploadParams = null;
+    let _selectedSessionDsid = null;
+    let _pollInterval = null;
+
+    function confirmSessionSelection(dsid) {
+      const modal = bootstrap.Modal.getInstance(document.getElementById("select-session-modal"));
+      if (modal) modal.hide();
+
+      if (dsid === null) {
+        _selectedSessionDsid = "new";
+        if (_pendingUploadParams) startUploadRequest(_pendingUploadParams);
+        return;
+      }
+      if (dsid === undefined) {
+        const checked = document.querySelector('#session-list input[type="radio"]:checked');
+        if (!checked) { showStatus("Please select a session.", "warning"); return; }
+        dsid = checked.value;
+      }
+
+      _selectedSessionDsid = dsid;
+      if (_pendingUploadParams) startUploadRequest(_pendingUploadParams);
+    }
+
     async function doUpload() {
       const orcid = state.orcid;
       const project_id = document.getElementById("project").value;
@@ -442,74 +567,96 @@
         return;
       }
 
+      clearStatus();
+      _selectedSessionDsid = null;
+
+      const uploadParams = {
+        orcid,
+        project_id,
+        instrument_name,
+        session_folder_path,
+        sample_unique_id: document.getElementById("sample-uid").value.trim() || null,
+        comments: document.getElementById("comments").value.trim(),
+      };
+
+      try {
+        const checkRes = await fetch("/api/session/check", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(uploadParams),
+        });
+        const checkData = await checkRes.json();
+
+        if (checkRes.ok && checkData.sessions) {
+          if (checkData.sessions.length === 1) {
+            _selectedSessionDsid = checkData.sessions[0].unique_id;
+          } else if (checkData.sessions.length > 1) {
+            _pendingUploadParams = uploadParams;
+            const listEl = document.getElementById("session-list");
+            listEl.innerHTML = "";
+            checkData.sessions.forEach((s, i) => {
+              const label = s.dataset_name + (s.creation_time ? ` (created: ${s.creation_time})` : "");
+              listEl.innerHTML += `
+                <label class="list-group-item d-flex align-items-center">
+                  <input type="radio" name="session-choice" class="form-check-input me-2" value="${s.unique_id}" ${i === 0 ? "checked" : ""} />
+                  <span>${label}</span>
+                </label>`;
+            });
+            const modal = new bootstrap.Modal(document.getElementById("select-session-modal"));
+            modal.show();
+            return;
+          }
+        }
+      } catch (e) {
+        showStatus("Session check failed: " + e.message, "danger");
+        return;
+      }
+
+      startUploadRequest(uploadParams);
+    }
+
+    async function startUploadRequest(params) {
       setSpinner("upload", true);
       document.getElementById("btn-upload").disabled = true;
-      clearStatus();
       resetUploadModal();
 
-      // Show the modal
       if (!uploadModal) {
         uploadModal = new bootstrap.Modal(document.getElementById("upload-modal"));
       }
       uploadModal.show();
-      setProgress(0, "Starting upload...");
+      setProgress(50, "Running upload flow...");
 
-      // POST with fetch, then read the SSE stream from the response body
+      const body = { ...params };
+      if (_selectedSessionDsid !== null) body.session_dsid = _selectedSessionDsid;
+
       try {
         const res = await fetch("/api/upload", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            orcid,
-            project_id,
-            instrument_name,
-            session_folder_path,
-            sample_unique_id: document.getElementById("sample-uid").value.trim() || null,
-            comments: document.getElementById("comments").value.trim(),
-          }),
+          body: JSON.stringify(body),
         });
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
+        const data = await res.json();
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
+        if (res.ok) {
+          setProgress(30, "Flow submitted, running...");
+          // Show Prefect monitoring link immediately
+          const prefectUrl = "http://127.0.0.1:4200/flow-runs/flow-run/" + data.flow_run_id;
+          document.getElementById("prefect-link").href = prefectUrl;
+          document.getElementById("qr-section").classList.remove("d-none");
+          document.getElementById("upload-modal-footer").classList.remove("d-none");
 
-          // Parse SSE messages from buffer
-          const parts = buffer.split("\n\n");
-          buffer = parts.pop(); // keep incomplete chunk
-          for (const part of parts) {
-            let eventType = "message";
-            let dataStr = "";
-            for (const line of part.split("\n")) {
-              if (line.startsWith("event: ")) eventType = line.slice(7);
-              else if (line.startsWith("data: ")) dataStr = line.slice(6);
-            }
-            if (!dataStr) continue;
-            const data = JSON.parse(dataStr);
-
-            if (eventType === "progress") {
-              setProgress(data.percent, data.message);
-            } else if (eventType === "complete") {
-              const bar = document.getElementById("progress-bar");
-              bar.classList.remove("progress-bar-striped", "progress-bar-animated");
-              bar.classList.add("bg-success");
-              setProgress(100, "Upload complete!");
-              showUploadSuccess(data.session_dsid, data.project_id);
-            } else if (eventType === "error") {
-              const bar = document.getElementById("progress-bar");
-              bar.classList.remove("progress-bar-striped", "progress-bar-animated");
-              bar.classList.add("bg-danger");
-              document.getElementById("progress-label").textContent = "Upload failed";
-              document.getElementById("upload-modal-title").textContent = "Upload Failed";
-              document.getElementById("upload-modal-header").classList.add("bg-danger", "text-white");
-              document.getElementById("upload-modal-footer").classList.remove("d-none");
-              showStatus(data.error, "danger");
-            }
-          }
+          // Poll for completion
+          pollFlowRun(data.flow_run_id, data.project_id);
+        } else {
+          const bar = document.getElementById("progress-bar");
+          bar.classList.remove("progress-bar-striped", "progress-bar-animated");
+          bar.classList.add("bg-danger");
+          document.getElementById("progress-label").textContent = "Upload failed";
+          document.getElementById("upload-modal-title").textContent = "Upload Failed";
+          document.getElementById("upload-modal-header").classList.add("bg-danger", "text-white");
+          document.getElementById("upload-modal-footer").classList.remove("d-none");
+          showStatus(data.error || "Unknown error", "danger");
         }
       } catch (e) {
         showStatus("Upload error: " + e.message, "danger");
@@ -521,25 +668,52 @@
     }
 
     // -------------------------------------------------------------------------
-    // Show success state in upload modal (QR code)
+    // Poll flow run until complete, then show Crucible link + QR
     // -------------------------------------------------------------------------
-    function showUploadSuccess(sessionDsid, projectId) {
-      const baseUrl = "https://crucible-graph-explorer-776258882599.us-central1.run.app";
+    function pollFlowRun(flowRunId, projectId) {
+      if (_pollInterval) clearInterval(_pollInterval);
+      _pollInterval = setInterval(async () => {
+        try {
+          const res = await fetch("/api/flow-run/" + flowRunId);
+          const data = await res.json();
 
-      document.getElementById("upload-modal-title").textContent = "Upload Successful!";
-      document.getElementById("upload-modal-header").classList.add("bg-success", "text-white");
-      document.getElementById("upload-modal-footer").classList.remove("d-none");
+          if (data.status === "COMPLETED") {
+            clearInterval(_pollInterval);
+            const bar = document.getElementById("progress-bar");
+            bar.classList.remove("progress-bar-striped", "progress-bar-animated");
+            bar.classList.add("bg-success");
+            setProgress(100, "Upload complete!");
+            document.getElementById("upload-modal-title").textContent = "Upload Complete!";
+            document.getElementById("upload-modal-header").classList.add("bg-success", "text-white");
 
-      const datasetUrl = baseUrl + "/" + projectId + "/dataset/" + sessionDsid;
-      document.getElementById("crucible-link").href = datasetUrl;
-      const qrContainer = document.getElementById("qr-code");
-      qrContainer.innerHTML = "";
-      new QRCode(qrContainer, {
-        text: datasetUrl,
-        width: 256,
-        height: 256,
-      });
-      document.getElementById("qr-section").classList.remove("d-none");
+            // Show Crucible link + QR code
+            const sessionDsid = data.result;
+            if (sessionDsid && projectId) {
+              const crucibleBaseUrl = "https://crucible-graph-explorer-776258882599.us-central1.run.app";
+              const datasetUrl = crucibleBaseUrl + "/" + projectId + "/dataset/" + sessionDsid;
+              document.getElementById("crucible-link").href = datasetUrl;
+              document.getElementById("crucible-link").parentElement.classList.remove("d-none");
+              const qrContainer = document.getElementById("qr-code");
+              qrContainer.innerHTML = "";
+              new QRCode(qrContainer, { text: datasetUrl, width: 256, height: 256 });
+            }
+          } else if (data.status === "FAILED" || data.status === "CRASHED" || data.status === "CANCELLED") {
+            clearInterval(_pollInterval);
+            const bar = document.getElementById("progress-bar");
+            bar.classList.remove("progress-bar-striped", "progress-bar-animated");
+            bar.classList.add("bg-danger");
+            document.getElementById("progress-label").textContent = "Upload failed";
+            document.getElementById("upload-modal-title").textContent = "Upload Failed";
+            document.getElementById("upload-modal-header").classList.add("bg-danger", "text-white");
+            showStatus("Flow run failed. Check the Prefect UI for details.", "danger");
+          } else {
+            // Still running — update progress label
+            setProgress(50, "Running: " + (data.name || "processing..."));
+          }
+        } catch (e) {
+          // Polling error — keep trying
+        }
+      }, 5000);
     }
 
     // -------------------------------------------------------------------------
@@ -568,6 +742,18 @@
     function clearStatus() {
       document.getElementById("status-box").innerHTML = "";
     }
+
+    document.getElementById("upload-modal").addEventListener("hidden.bs.modal", function () {
+      if (_pollInterval) { clearInterval(_pollInterval); _pollInterval = null; }
+      _pendingUploadParams = null;
+      _selectedSessionDsid = null;
+      document.getElementById("session-folder").value = "";
+      document.getElementById("sample-name").value = "";
+      document.getElementById("sample-uid").value = "";
+      document.getElementById("description").value = "";
+      document.getElementById("comments").value = "";
+      clearStatus();
+    });
 
     init();
   </script>
