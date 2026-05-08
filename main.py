@@ -6,15 +6,12 @@ import queue
 import threading
 import webbrowser
 import tkinter as tk
-import webbrowser
 from tkinter import filedialog
 
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request
 
-import json
-
-import backend
-from instrument_conf import DEFAULT_BROWSE_DIR, IS_SESSION, DEFAULT_INSTRUMENT_NAME, PRINT_BARCODE_ENABLED, INSTRUMENTS
+import prefect_backend as backend
+from instrument_conf import DEFAULT_BROWSE_DIR, IS_SESSION, DEFAULT_INSTRUMENT_NAME, PRINT_BARCODE_ENABLED, INSTRUMENTS, INSTRUMENT_FLOWS
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(funcName)s: %(message)s")
 
@@ -106,6 +103,61 @@ def sample_lookup():
     return jsonify(result)
 
 
+@app.post("/api/sample/create")
+def sample_create():
+    data = request.json or {}
+    sample_name = (data.get("sample_name") or "").strip()
+    owner_orcid = (data.get("owner_orcid") or "").strip()
+    project_id = (data.get("project_id") or "").strip()
+    if not sample_name or not owner_orcid or not project_id:
+        return jsonify({"error": "sample_name, owner_orcid, and project_id are required"}), 400
+    try:
+        result = backend.create_sample(
+            sample_name=sample_name,
+            owner_orcid=owner_orcid,
+            project_id=project_id,
+            description=data.get("description") or None,
+            sample_type=data.get("sample_type") or None,
+        )
+    except Exception as e:
+        backend.logger.error(e)
+        return jsonify({"error": str(e)}), 500
+    return jsonify(result)
+
+
+@app.post("/api/sample/print-barcode")
+def print_barcode():
+    data = request.json or {}
+    sample_unique_id = data.get("sample_unique_id", "").strip()
+    sample_name = data.get("sample_name", "").strip()
+    if not sample_unique_id:
+        return jsonify({"error": "Missing sample_unique_id"}), 400
+    try:
+        backend.print_sample_barcode(sample_unique_id, sample_name)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True})
+
+
+@app.post("/api/session/check")
+def session_check():
+    data = request.json or {}
+    required = ["orcid", "project_id", "instrument_name", "session_folder_path"]
+    missing = [f for f in required if not (data.get(f) or "").strip()]
+    if missing:
+        return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+    try:
+        sessions = backend.check_existing_sessions(
+            session_folder_path=data["session_folder_path"].strip(),
+            orcid=data["orcid"].strip(),
+            project_id=data["project_id"].strip(),
+            instrument_name=data["instrument_name"].strip(),
+        )
+    except Exception as e:
+        backend.logger.error(e)
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"sessions": sessions})
+
 
 @app.post("/api/upload")
 def do_upload():
@@ -118,103 +170,62 @@ def do_upload():
     orcid = data["orcid"].strip()
     project_id = data["project_id"].strip()
     instrument_name = data["instrument_name"].strip()
-    sample_unique_id = data.get("sample_unique_id", None)  
+    sample_unique_id = data.get("sample_unique_id", None)
+    session_dsid = data.get("session_dsid", None)
     session_folder_path = data["session_folder_path"].strip()
     comments = data.get("comments", "").strip()
     kw_list = []
 
-    def _sse(event, payload):
-        return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
+    # Look up the Prefect deployment for this instrument
+    deployment_name = INSTRUMENT_FLOWS.get(instrument_name)
+    if not deployment_name:
+        return jsonify({"error": f"No upload flow configured for instrument '{instrument_name}'"}), 400
 
-    def generate():
-        try:
-            # Step 1: Validate path depth
-            from pathlib import Path
-            MIN_DEPTH = 3
-            parts = Path(session_folder_path).resolve().parts
-            if len(parts) - 1 < MIN_DEPTH:
-                yield _sse("error", {"error": f"Session folder is too close to the filesystem root. Please select a folder at least {MIN_DEPTH} levels deep."})
-                return
-
-            # Step 2: Copy to Google Drive
-            yield _sse("progress", {"step": "gdrive", "message": "Copying files to Google Drive...", "percent": 5})
-            try:
-                backend.copy_all_files_to_gdrive(session_folder_path, instrument_name)
-            except Exception as e:
-                backend.logger.error(e)
-
-            
-            if IS_SESSION is False:
-                session_id = None
-                file_name = session_folder_path
-
-                # Step 3: Upload the dataset
-                yield _sse("progress", {"step": "file", "message": f"Processing file {file_name}"})
-                try:
-                    new_dsid = backend.upload_dataset(
-                        session_folder_path, instrument_name, project_id, orcid,
-                        session_name = None, session_dsid = None, sample_unique_id = sample_unique_id, 
-                        kw_list = kw_list, comments = comments)
-                    
-                    yield _sse("complete", {"session_dsid": new_dsid, "project_id": project_id})
-
-                except Exception as e:
-                    yield _sse("error", {"error": f"Failed on {file_name}: {e}"})
-                    return
+    try:
+        from prefect.deployments import run_deployment
+        flow_run = run_deployment(
+            deployment_name,
+            parameters={
+                "file": session_folder_path,
+                "instrument_name": instrument_name,
+                "project_id": project_id,
+                "orcid": orcid,
+                "sample_unique_id": sample_unique_id,
+                "session_dsid": session_dsid,
+                "kw_list": kw_list,
+                "comments": comments,
+            },
+            timeout=0,  # return immediately, monitor in Prefect UI
+        )
+        return jsonify({"flow_run_id": str(flow_run.id), "project_id": project_id})
+    except Exception as e:
+        backend.logger.error(e)
+        return jsonify({"error": str(e)}), 500
 
 
-            else:
-                # Step 3: Identify session files
-                yield _sse("progress", {"step": "identify", "message": "Identifying session files...", "percent": 15})
-                session_files = backend.identify_session_files(session_folder_path)
-                total_files = len(session_files)
+@app.get("/api/flow-run/<flow_run_id>")
+def flow_run_status(flow_run_id):
+    from prefect.client.orchestration import get_client
+    from pathlib import Path
+    import asyncio
 
-                # Step 4: Create session dataset
-                yield _sse("progress", {"step": "session", "message": "Creating session in Crucible...", "percent": 20})
-                try:
-                    session_name, session_id = backend.create_session(
-                        session_folder_path, kw_list, comments,
-                        orcid, project_id, instrument_name, sample_unique_id)
-                    backend.logger.info(f"Created session '{session_name}' with ID {session_id}")
-                except Exception as e:
-                    backend.logger.error(e)
-                    yield _sse("error", {"error": f"Failed to create session: {e}"})
-                    return
+    async def _get_status():
+        async with get_client() as prefect_client:
+            flow_run = await prefect_client.read_flow_run(flow_run_id)
+            return {
+                "status": flow_run.state.type.value,
+                "name": flow_run.state.name,
+            }
 
-                # Step 5: Process each file
-                if total_files == 0:
-                    yield _sse("progress", {"step": "done", "message": "No data files found, session created.", "percent": 100})
-                else:
-                    for i, file in enumerate(session_files):
-                        file_name = Path(file).name
-                        base_percent = 25
-                        file_percent = base_percent + int((i + 1) / total_files * 75)
-                        yield _sse("progress", {
-                            "step": "file",
-                            "message": f"Processing file {i + 1}/{total_files}: {file_name}",
-                            "percent": min(file_percent, 99),
-                            "current": i + 1,
-                            "total": total_files,
-                        })
-                        try:
-                            new_dsid = backend.upload_dataset(
-                                file, instrument_name, project_id, orcid,
-                                session_name, session_id, sample_unique_id,
-                                kw_list, comments)
-                            backend.logger.info(f"Uploaded file '{file_name}' as dataset ID {new_dsid}")
-                        except Exception as e:
-                            backend.logger.error(e)
-                            yield _sse("error", {"error": f"Failed on {file_name}: {e}"})
-                            return
-
-                yield _sse("complete", {"session_dsid": session_id, "project_id": project_id})
-
-        except Exception as e:
-            backend.logger.error(e)
-            yield _sse("error", {"error": str(e)})
-
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    try:
+        result = asyncio.run(_get_status())
+        # Read persisted result from shared file
+        result_file = Path(".flow_results") / flow_run_id
+        if result_file.exists():
+            result["result"] = result_file.read_text()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":

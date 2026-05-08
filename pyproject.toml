@@ -8,6 +8,8 @@ dependencies = [
     "flask>=3.0",
     "nano-crucible>=2.0.2",
     "pillow>=12.1.1",
+    "prefect>=3.7.0",
     "python-dotenv>=1.2.2",
     "qrcode>=8.2",
+    "requests>=2.32.5",
 ]
