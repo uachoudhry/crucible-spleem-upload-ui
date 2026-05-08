@@ -144,8 +144,18 @@
           <button class="btn btn-outline-secondary" onclick="browseFolder()">Browse…</button>
         </div>
         <label class="form-label fw-semibold">Comments</label>
-        <textarea id="comments" class="form-control" rows="3"
-                  placeholder="Any notes about this session (optional)..."></textarea>
+        <div class="d-flex gap-2">
+          <button id="btn-voice" class="btn btn-outline-secondary align-self-start" type="button"
+                  onclick="toggleVoice()" title="Voice input (click to start/stop)">
+            <svg id="mic-icon" xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 16 16">
+              <path d="M3.5 6.5A.5.5 0 0 1 4 7v1a4 4 0 0 0 8 0V7a.5.5 0 0 1 1 0v1a5 5 0 0 1-4.5 4.975V15h3a.5.5 0 0 1 0 1h-7a.5.5 0 0 1 0-1h3v-2.025A5 5 0 0 1 3 8V7a.5.5 0 0 1 .5-.5z"/>
+              <path d="M10 3a2 2 0 1 1-4 0v5a2 2 0 1 1 4 0V3zM8 0a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V3a3 3 0 0 0-3-3z"/>
+            </svg>
+          </button>
+          <textarea id="comments" class="form-control" rows="3"
+                    placeholder="Any notes about this session (optional)..."></textarea>
+        </div>
+        <small id="voice-status" class="form-text text-muted d-none">Listening...</small>
       </div>
     </div>
 
@@ -754,6 +764,83 @@
       document.getElementById("comments").value = "";
       clearStatus();
     });
+
+    // -------------------------------------------------------------------------
+    // Voice Input (Web Speech API)
+    // -------------------------------------------------------------------------
+    let _recognition = null;
+    let _voiceActive = false;
+
+    function toggleVoice() {
+      if (_voiceActive) {
+        stopVoice();
+      } else {
+        startVoice();
+      }
+    }
+
+    function startVoice() {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SpeechRecognition) {
+        showStatus("Speech recognition is not supported in this browser. Use Chrome or Edge.", "warning");
+        return;
+      }
+
+      _recognition = new SpeechRecognition();
+      _recognition.continuous = true;
+      _recognition.interimResults = true;
+      _recognition.lang = "en-US";
+
+      const comments = document.getElementById("comments");
+      const baseText = comments.value;
+
+      _recognition.onresult = function (event) {
+        let final = "";
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          if (event.results[i].isFinal) {
+            final += event.results[i][0].transcript;
+          }
+        }
+        if (final) {
+          comments.value = comments.value + final;
+        }
+      };
+
+      _recognition.onerror = function (event) {
+        if (event.error !== "no-speech") {
+          showStatus("Voice error: " + event.error, "warning");
+        }
+        stopVoice();
+      };
+
+      _recognition.onend = function () {
+        if (_voiceActive) {
+          _recognition.start();
+        }
+      };
+
+      _recognition.start();
+      _voiceActive = true;
+
+      if (comments.value.length > 0 && !comments.value.endsWith("\n")) {
+        comments.value = comments.value.trimEnd() + ".\n";
+      }
+
+      document.getElementById("btn-voice").classList.remove("btn-outline-secondary");
+      document.getElementById("btn-voice").classList.add("btn-danger");
+      document.getElementById("voice-status").classList.remove("d-none");
+    }
+
+    function stopVoice() {
+      _voiceActive = false;
+      if (_recognition) {
+        _recognition.stop();
+        _recognition = null;
+      }
+      document.getElementById("btn-voice").classList.remove("btn-danger");
+      document.getElementById("btn-voice").classList.add("btn-outline-secondary");
+      document.getElementById("voice-status").classList.add("d-none");
+    }
 
     init();
   </script>
