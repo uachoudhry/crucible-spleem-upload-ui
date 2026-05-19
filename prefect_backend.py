@@ -264,7 +264,7 @@ def _compute_sha256(file_path: str) -> str:
     return h.hexdigest()
 
 
-@task(retries=3, retry_delay_seconds=5)
+@task
 def create_dataset(files: list[str],
                    instrument_name: str | None = None,
                    project_id: str | None = None,
@@ -431,7 +431,7 @@ def tem_session_upload(file: str, instrument_name: str, project_id: str, orcid: 
     # returns list of files in folder path that are less than 20GB 
     # with an accepted file type
     session_files = identify_session_files(session_folder_path)
-
+    logger.info(f'{session_files=}')
     # Submit all child flows in parallel (timeout=0 returns immediately)
     child_runs = []
     for f in session_files:
