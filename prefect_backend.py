@@ -8,11 +8,11 @@ import subprocess as sp
 from crucible import CrucibleClient
 from crucible.models import BaseDataset
 import logging
-import asyncio
 from prefect import flow, task
-from prefect.cache_policies import INPUTS
+from prefect.logging import get_run_logger
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
 
 
 class MultipleSessionsFound(Exception):
@@ -74,20 +74,19 @@ def lookup_user_by_email(email: str) -> dict:
 
     Returns an empty dict if the user is not found.
     """
-    user_info = client.get_user(email=email)
+    user_info = client.users.get(email=email)
     logger.info(f"Lookup for email '{email}' returned: {user_info}")
     if user_info is None:
-        # TODO: prompt user to search by orcid
         return {}
 
     user_name = f"{user_info['first_name']} {user_info['last_name']}"
     logger.info(f"User name for email '{email}' is: {user_name}")
-    projects = client.list_projects(user_info['orcid'])
+    projects = client.projects.list(user_info['unique_id'])
     project_ids = [x['project_id'] for x in projects]
     project_ids.sort()
     logger.info(f"Projects for email '{email}' are: {project_ids}")
     return {'name': user_name,
-            'orcid': user_info['orcid'],
+            'orcid': user_info['unique_id'],
             'projects': project_ids}
 
 
@@ -110,7 +109,7 @@ def lookup_sample(sample_name: str | None = None, sample_unique_id: str | None =
         "project_id": project_id,
     }.items() if v is not None}
 
-    found_samples = client.list_samples(**kwargs)
+    found_samples = client.samples.list(**kwargs)
 
     # If you only find one sample - great, otherwise warn user
     if len(found_samples) == 1:
@@ -145,12 +144,13 @@ def create_sample(sample_name: str, owner_orcid: str, project_id: str,
         "timestamp": timestamp,
         "project_id": project_id,
         "sample_type": sample_type,
-        "owner_orcid": owner_orcid,
+        "owner_user_id": owner_orcid,
     }.items() if v is not None}
 
     result = client.samples.create(**kwargs)
     logger.info(f"Created sample: {result}")
-    created = result.get('created_record', result)
+    #created = result.get('created_record', result)
+    created = result
     return {
         'unique_id': created.get('unique_id', ''),
         'sample_name': created.get('sample_name', sample_name),
@@ -198,7 +198,6 @@ def check_existing_sessions(session_folder_path: str, orcid: str, project_id: st
     ]
 
 
-@task(retries=3, retry_delay_seconds=5)
 def create_session(session_folder_path: str, kw_list: list[str], comments: str, orcid: str,
                    project_id: str, instrument_name: str, sample_unique_id: str | None = None,
                    session_dsid: str | None = None) -> tuple[str, str]:
@@ -227,19 +226,53 @@ def create_session(session_folder_path: str, kw_list: list[str], comments: str, 
                                       dataset_id=use_session_dsid)
     return session_name, use_session_dsid
 
+
+def get_or_create_insitu_dataset(file_path: str, orcid: str, project_id: str,
+                                 kw_list: list[str], comments: str) -> str:
+    """Return the dsid of an existing insitu dataset for this file/user/project,
+    creating an empty one if none exists. Used by /api/upload to obtain a dsid
+    synchronously so the UI can show the Crucible link before the flow runs.
+    """
+    project_id = project_id.replace('Internal Research (', '').replace(')', '').strip()
+    dataset_name = Path(file_path).name
+
+    existing = client.datasets.list(
+        dataset_name=dataset_name,
+        owner_orcid=orcid,
+        project_id=project_id,
+        limit=None,
+    )
+    found_dsid = None
+    if existing:
+        existing.sort(key=lambda d: d.get('modification_time') or '', reverse=True)
+        found_dsid = existing[0]['unique_id']
+
+    ds_kwargs = {k: v for k, v in dict(
+        unique_id=found_dsid,
+        dataset_name=dataset_name,
+        owner_orcid=orcid,
+        project_id=project_id,
+    ).items() if v is not None}
+    ds = BaseDataset(**ds_kwargs)
+    scimd = {'comments': comments} if comments else {}
+    new_ds = client.datasets.create(ds, scientific_metadata=scimd, keywords=kw_list)
+    return new_ds['created_record']['unique_id']
+
+
 @task
 def identify_session_files(session_folder_path: str) -> list[str]:
-    acceptable_suffixes = {'.emd', '.dm3', '.dm4', '.bcf', '.ser', '.mcr', '.h5'}
-    max_size = 2 * 1024 ** 3  # 2 GiB
+    from instrument_conf import ACCEPTABLE_FILE_TYPES
+    max_size = 20 * 1024 ** 3  # 20 GiB
     return [
         str(f) for f in Path(session_folder_path).rglob("*") if f.is_file()
-        and f.suffix.lower() in acceptable_suffixes
+        and f.suffix.lower() in ACCEPTABLE_FILE_TYPES
         and f.stat().st_size < max_size
     ]
 
 
 @task(retries=3, retry_delay_seconds=10)
 def copy_all_files_to_gdrive(session_folder_path: str, instrument_name: str) -> None:
+    logger = get_run_logger()
     p = Path(session_folder_path)
     relative_folder_path = p.relative_to(p.anchor).as_posix()
     dest = f"{instrument_name}-gdrive:/crucible-uploads/{instrument_name}/{relative_folder_path}"
@@ -251,69 +284,69 @@ def copy_all_files_to_gdrive(session_folder_path: str, instrument_name: str) -> 
         logger.error(f'rclone copy for {session_folder_path} to google drive failed with error {e}')
 
 
-@task(retries=3, retry_delay_seconds=10)
-def copy_dataset_to_cloud(file: str, instrument_name: str, storage_bucket: str = 'crucible-uploads',
-                          rclone_mount: str = 'mf-cloud-storage') -> list[str]:
-    p = Path(file)
-    ftype = p.suffix.lstrip('.')
-
-    # find any associated files
-    files_to_upload = [file, get_emi_file_name(file)] if ftype == 'ser' else [file]
-
-    # copy
-    cloud_files = []
-    for i, local_file_path in enumerate(files_to_upload):
-        lp = Path(local_file_path)
-        local_rel_path = lp.parent.relative_to(lp.parent.anchor).as_posix()
-        cloud_rel_path = f"{instrument_name}/{local_rel_path}"
-        rclone_dest = f'{rclone_mount}:{storage_bucket}/{cloud_rel_path}'
-        dry_run = True if i == 0 else False  # only do dry run for the first file to check for errors before copying all files
-        run_rclone_command(local_file_path, rclone_dest, 'copy', background=False, checkflag=True, dry_run = dry_run)
-        
-        cloud_files.append(f'{cloud_rel_path}/{lp.name}')
-
-    return cloud_files
+def _compute_sha256(file_path: str) -> str:
+    import hashlib
+    _CHUNK = 32 * 1024 * 1024
+    h = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        for block in iter(lambda: f.read(_CHUNK), b''):
+            h.update(block)
+    return h.hexdigest()
 
 
-@task(retries=3, retry_delay_seconds=5)
-def create_sql_record_for_dataset(cloud_files: list[str], 
-                                  instrument_name: str | None = None,
-                                  project_id: str | None = None,
-                                  orcid: str | None = None,
-                                  session_name: str | None = None,
-                                  kw_list: list[str] = [],
-                                  comments: str | None = None):
-    
-    existing = client.datasets.list(file_to_upload = cloud_files[0], owner_orcid = orcid, project_id = project_id, session_name = session_name)
-    if len(existing) > 0:
-        existing.sort(key=lambda ds: ds.get('modification_time', ''), reverse=True)
-        return existing[0]['unique_id']
-    
-    # create the dataset
+@task
+def create_dataset(files: list[str],
+                   instrument_name: str | None = None,
+                   project_id: str | None = None,
+                   orcid: str | None = None,
+                   session_name: str | None = None,
+                   kw_list: list[str] = [],
+                   comments: str | None = None) -> str:
+    logger = get_run_logger()
+
+    # Dedup + retry resume: for each file, check if an associated file with the
+    # same SHA256 already exists in a dataset for this session. If found, pass
+    # that unique_id to BaseDataset so datasets.create() runs against the existing
+    # record — the file upload is skipped (SHA256 dedup in _upload_file_gcs) and
+    # any previously failed steps (metadata, keywords, links) are retried.
+    found_dsid = None
+    for file_path in files:
+        file_sha256 = _compute_sha256(file_path)
+        logger.info(f"SHA256 for {Path(file_path).name}: {file_sha256}")
+        for file_rec in client.files.list_files(sha256_hash=file_sha256):
+            dsid = file_rec.get('dataset_mfid')
+            if not dsid:
+                continue
+            ds = client.datasets.get(dsid)
+            if (ds
+                    and ds.get('session_name') == session_name
+                    and ds.get('project_id') == project_id
+                    and ds.get('owner_orcid') == orcid):
+                found_dsid = dsid
+                logger.info(f"File {Path(file_path).name} already in dataset {found_dsid}; resuming")
+                break
+        if found_dsid:
+            break
+
     ds_kwargs = {k: v for k, v in dict(
-        file_to_upload=cloud_files[0],
+        unique_id=found_dsid,
         owner_orcid=orcid,
         project_id=project_id,
         instrument_name=instrument_name,
         session_name=session_name,
     ).items() if v is not None}
     ds = BaseDataset(**ds_kwargs)
-
-    scimd = {'comments': comments}  # TODO: ADD CLAUDE API CALL
-    new_ds = client.datasets.create(ds, scientific_metadata=scimd, keywords=kw_list)
-
+    scimd = {'comments': comments} if comments else {}
+    new_ds = client.datasets.create(
+        ds,
+        scientific_metadata=scimd,
+        keywords=kw_list,
+        files_to_upload=files,
+        wait_for_ingestion_response=True,
+    )
     new_ds_dsid = new_ds['created_record']['unique_id']
+    logger.info(f"{'Resumed' if found_dsid else 'Created'} dataset {new_ds_dsid} for {', '.join(Path(f).name for f in files)}")
     return new_ds_dsid
-
-
-@task(retries=3, retry_delay_seconds=5)
-def run_data_ingestion(new_ds_dsid, ingestion_class: str | None = None):
-    ingestion_status = client.datasets.request_ingestion(new_ds_dsid, ingestion_class=ingestion_class, wait_for_response=True)
-    if ingestion_status['status'] != 'complete':
-        logger.error(f'Ingestion failed for dataset {new_ds_dsid} with status {ingestion_status}')
-        raise RuntimeError(f'Ingestion failed for dataset {new_ds_dsid} with status {ingestion_status}')
-    
-    return ingestion_status['status']
 
 
 @task(retries=3, retry_delay_seconds=5)
@@ -332,90 +365,105 @@ def link_dataset_and_sample(new_ds_dsid: str, sample_unique_id: str | None = Non
     return None
 
 @task(retries=3, retry_delay_seconds=5)
-def request_insitu_aggregation(new_ds_dsid: str, ingestion_status: str):
+def request_insitu_aggregation(new_ds_dsid: str):
     response = client.datasets.request_insitu_aggregation(new_ds_dsid)
     return response
-
-
-RESULTS_DIR = Path(".flow_results")
-RESULTS_DIR.mkdir(exist_ok=True)
-
-
-def _save_flow_result(dsid: str):
-    from prefect.runtime import flow_run
-    (RESULTS_DIR / str(flow_run.id)).write_text(dsid)
 
 
 def _run_name(prefix):
     def generate():
         from prefect.runtime import flow_run
-        return f"{prefix}-{Path(flow_run.parameters['file']).name}"
+        fileinput = flow_run.parameters.get('file', None)
+        if fileinput is None:
+            fileinput = flow_run.parameters.get('files', [None])[0]
+        return f"{prefix}-{Path(fileinput).name}"
     return generate
 
 
-@flow(flow_run_name=_run_name("insitu-upload"), persist_result=True)
-def insitu_upload(file: str, instrument_name: str, project_id: str, orcid: str, sample_unique_id: str | None = None, session_dsid: str | None = None, kw_list: list[str] = [], comments: str | None = None) -> str:
-    # copy the files to temp bucket
-    cloud_files = copy_dataset_to_cloud(file, instrument_name)
-
-    # create the dataset
-    new_ds_dsid = create_sql_record_for_dataset(cloud_files, None, project_id, orcid, kw_list=kw_list, comments=comments)
-
-    # request ingestion
-    ingestion_status = run_data_ingestion(new_ds_dsid, ingestion_class=None)
-
-    # check about linking to session and sample
-    # session_link_status = link_dataset_to_session(new_ds_dsid, session_dsid)
-    # sample_link_status = link_dataset_and_sample(new_ds_dsid, sample_unique_id)
-
-    # request post processing
-    aggregation_status = request_insitu_aggregation(new_ds_dsid, ingestion_status)
-    _save_flow_result(new_ds_dsid)
-    return new_ds_dsid
+@task(retries=3, retry_delay_seconds=10)
+def add_file_to_insitu_dataset(dsid: str, file_path: str) -> None:
+    client.datasets.add_file_to_dataset(
+        dsid=dsid, file_path=file_path, wait_for_ingestion_response=True,
+    )
 
 
+# flow to upload an insitu dataset (dataset record pre-created by /api/upload)
+@flow(flow_run_name=_run_name("insitu-upload"))
+def insitu_upload(file: str,
+                  instrument_name: str,
+                  project_id: str,
+                  orcid: str,
+                  sample_unique_id: str | None = None,
+                  session_dsid: str | None = None,
+                  kw_list: list[str] = [],
+                  comments: str | None = None) -> str:
+
+    add_file_to_insitu_dataset(session_dsid, file)
+    request_insitu_aggregation(session_dsid)
+    return session_dsid
+
+# sub flow to upload a dataset as the child of a session
 @flow(flow_run_name=_run_name("upload"))
-def upload_child_dataset(file: str, instrument_name: str, project_id: str, orcid: str,
-                         session_name: str, session_dsid: str,
+def upload_child_dataset(files: list,
+                         instrument_name: str,
+                         project_id: str,
+                         orcid: str,
+                         session_name: str,
+                         session_dsid: str,
                          sample_unique_id: str | None = None,
-                         kw_list: list[str] = [], comments: str | None = None) -> str:
-    cloud_files = copy_dataset_to_cloud(file, instrument_name)
-    new_ds_dsid = create_sql_record_for_dataset(cloud_files, instrument_name, project_id, orcid,
-                                 session_name=session_name, kw_list=kw_list, comments=comments)
-    run_data_ingestion(new_ds_dsid)
+                         kw_list: list[str] = [],
+                         comments: str | None = None) -> str:
+    
+    new_ds_dsid = create_dataset(files = files,
+                                 instrument_name = instrument_name,
+                                 project_id=project_id,
+                                 orcid=orcid,
+                                 session_name=session_name,
+                                 kw_list=kw_list,
+                                 comments=comments)
+
     link_dataset_to_session(new_ds_dsid, session_dsid)
     link_dataset_and_sample(new_ds_dsid, sample_unique_id)
     return new_ds_dsid
 
-
-@flow(flow_run_name=_run_name("tem-session"), persist_result=True)
+# flow to upload a session of TEM data
+@flow(flow_run_name=_run_name("tem-session"))
 def tem_session_upload(file: str, instrument_name: str, project_id: str, orcid: str,
                        sample_unique_id: str | None = None, session_dsid: str | None = None,
                        kw_list: list[str] = [], comments: str | None = None) -> str:
     import time
+    import os
+    import requests as req
     from prefect.deployments import run_deployment
+    logger = get_run_logger()
 
     session_folder_path = file
 
     check_session_depth(session_folder_path)
 
-    copy_all_files_to_gdrive(session_folder_path, instrument_name)
+    # copy_all_files_to_gdrive(session_folder_path, instrument_name)  # not used for SPLEEM
 
     session_name, session_dsid = create_session(
         session_folder_path, kw_list, comments or "",
         orcid, project_id, instrument_name, sample_unique_id,
         session_dsid=session_dsid)
 
+    # returns list of files in folder path that are less than 20GB 
+    # with an accepted file type
     session_files = identify_session_files(session_folder_path)
-
+    logger.info(f'{session_files=}')
     # Submit all child flows in parallel (timeout=0 returns immediately)
     child_runs = []
     for f in session_files:
         time.sleep(0.3)
+        dsfiles = [f]
+        # if f.endswith('ser'):
+        #     dsfiles.append(get_emi_file_name(f))
+
         run = run_deployment(
             "upload-child-dataset/upload-child-dataset",
             parameters={
-                "file": f,
+                "files": dsfiles,
                 "instrument_name": instrument_name,
                 "project_id": project_id,
                 "orcid": orcid,
@@ -439,11 +487,15 @@ def tem_session_upload(file: str, instrument_name: str, project_id: str, orcid: 
         time.sleep(5)
         still_pending = set()
         for rid in pending:
-            import requests as req
-            import os
             api_url = os.environ.get("PREFECT_API_URL", "http://127.0.0.1:4200/api")
-            resp = req.get(f"{api_url}/flow_runs/{rid}")
-            state = resp.json().get("state", {}).get("type", "")
+            try:
+                resp = req.get(f"{api_url}/flow_runs/{rid}", timeout=10)
+                resp.raise_for_status()
+                state = resp.json().get("state", {}).get("type", "")
+            except Exception as e:
+                logger.warning(f"Could not poll flow run {rid}: {e}; will retry")
+                still_pending.add(rid)
+                continue
             if state not in terminal_states:
                 still_pending.add(rid)
             elif state != "COMPLETED":
@@ -454,109 +506,5 @@ def tem_session_upload(file: str, instrument_name: str, project_id: str, orcid: 
     if failed:
         logger.error(f"{len(failed)} child flow(s) failed. Retry them from the Prefect UI.")
 
-    _save_flow_result(session_dsid)
-    return session_dsid
-
-
-def _rclone_available() -> bool:
-    result = sp.run("rclone version", shell=True, stdout=sp.PIPE, stderr=sp.STDOUT)
-    return result.returncode == 0
-
-
-@task
-def identify_spleem_session_files(session_folder_path: str) -> list[str]:
-    acceptable_suffixes = {'.h5', '.tif', '.tiff', '.png', '.csv', '.txt'}
-    return [
-        str(f) for f in Path(session_folder_path).rglob("*")
-        if f.is_file() and f.suffix.lower() in acceptable_suffixes
-    ]
-
-
-@flow(flow_run_name=_run_name("spleem-upload"))
-def spleem_upload_child_dataset(file: str, instrument_name: str, project_id: str, orcid: str,
-                                session_name: str, session_dsid: str,
-                                sample_unique_id: str | None = None,
-                                kw_list: list[str] = [], comments: str | None = None) -> str:
-    if _rclone_available():
-        cloud_files = copy_dataset_to_cloud(file, instrument_name)
-        new_ds_dsid = create_sql_record_for_dataset(cloud_files, instrument_name, project_id, orcid,
-                                                    session_name=session_name, kw_list=kw_list, comments=comments)
-    else:
-        logger.warning("rclone not found — using direct upload for %s", Path(file).name)
-        ds = BaseDataset(file_to_upload=None, owner_orcid=orcid, project_id=project_id,
-                         instrument_name=instrument_name, session_name=session_name)
-        new_ds = client.datasets.create(ds, scientific_metadata={'comments': comments},
-                                        keywords=kw_list, files_to_upload=[file])
-        new_ds_dsid = new_ds['created_record']['unique_id']
-    run_data_ingestion(new_ds_dsid)
-    link_dataset_to_session(new_ds_dsid, session_dsid)
-    link_dataset_and_sample(new_ds_dsid, sample_unique_id)
-    return new_ds_dsid
-
-
-@flow(flow_run_name=_run_name("spleem-session"), persist_result=True)
-def spleem_session_upload(file: str, instrument_name: str, project_id: str, orcid: str,
-                          sample_unique_id: str | None = None, session_dsid: str | None = None,
-                          kw_list: list[str] = [], comments: str | None = None) -> str:
-    import time
-    from prefect.deployments import run_deployment
-
-    session_folder_path = file
-
-    check_session_depth(session_folder_path)
-    copy_all_files_to_gdrive(session_folder_path, instrument_name)
-
-    session_name, session_dsid = create_session(
-        session_folder_path, kw_list, comments or "",
-        orcid, project_id, instrument_name, sample_unique_id,
-        session_dsid=session_dsid)
-
-    session_files = identify_spleem_session_files(session_folder_path)
-
-    child_runs = []
-    for f in session_files:
-        time.sleep(0.3)
-        run = run_deployment(
-            "spleem-upload-child-dataset/spleem-upload-child-dataset",
-            parameters={
-                "file": f,
-                "instrument_name": instrument_name,
-                "project_id": project_id,
-                "orcid": orcid,
-                "session_name": session_name,
-                "session_dsid": session_dsid,
-                "sample_unique_id": sample_unique_id,
-                "kw_list": kw_list,
-                "comments": comments,
-            },
-            timeout=0,
-        )
-        child_runs.append(run)
-        logger.info(f"Submitted child flow for {Path(f).name}: {run.id}")
-
-    terminal_states = {"COMPLETED", "FAILED", "CRASHED", "CANCELLED"}
-    pending = {str(r.id) for r in child_runs}
-    failed = []
-
-    while pending:
-        time.sleep(5)
-        still_pending = set()
-        for rid in pending:
-            import requests as req
-            import os
-            api_url = os.environ.get("PREFECT_API_URL", "http://127.0.0.1:4200/api")
-            resp = req.get(f"{api_url}/flow_runs/{rid}")
-            state = resp.json().get("state", {}).get("type", "")
-            if state not in terminal_states:
-                still_pending.add(rid)
-            elif state != "COMPLETED":
-                failed.append(rid)
-                logger.error(f"Child flow run {rid} ended with state {state}")
-        pending = still_pending
-
-    if failed:
-        logger.error(f"{len(failed)} child flow(s) failed. Retry them from the Prefect UI.")
-
-    _save_flow_result(session_dsid)
     return session_dsid
 

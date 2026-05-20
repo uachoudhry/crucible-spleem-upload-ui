@@ -3,13 +3,13 @@ name = "crucible-upload-ui"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"  # qspleem project uses 3.11 (TEM UI uses 3.13)
+requires-python = ">=3.11"
 dependencies = [
     "flask>=3.0",
-    "nano-crucible>=2.0.2",
+    "nano-crucible==2.1.2",
     "pillow>=12.1.1",
-    "prefect>=3.7.0",
+    "prefect>=3.6.25",
+    "pytest>=9.0.3",
     "python-dotenv>=1.2.2",
     "qrcode>=8.2",
-    "requests>=2.32.5",
 ]

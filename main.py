@@ -12,10 +12,12 @@ from flask import Flask, jsonify, render_template, request
 
 import prefect_backend as backend
 from instrument_conf import DEFAULT_BROWSE_DIR, IS_SESSION, DEFAULT_INSTRUMENT_NAME, PRINT_BARCODE_ENABLED, INSTRUMENTS, INSTRUMENT_FLOWS
+from ai_services import voice_bp, extract_keywords
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(funcName)s: %(message)s")
 
 app = Flask(__name__)
+app.register_blueprint(voice_bp)
 
 # Tkinter must run on the main thread. Flask runs in a background thread.
 # We use two queues to hand off dialog requests/results between threads.
@@ -174,12 +176,38 @@ def do_upload():
     session_dsid = data.get("session_dsid", None)
     session_folder_path = data["session_folder_path"].strip()
     comments = data.get("comments", "").strip()
-    kw_list = []
+    kw_list = data.get("keywords", []) or extract_keywords(comments, instrument_name)
 
-    # Look up the Prefect deployment for this instrument
     deployment_name = INSTRUMENT_FLOWS.get(instrument_name)
     if not deployment_name:
         return jsonify({"error": f"No upload flow configured for instrument '{instrument_name}'"}), 400
+
+    # Create the session/dataset record synchronously so the UI can show the
+    # Crucible link + QR code immediately. The Prefect flow then handles the
+    # long-running file upload work against the already-created dsid.
+    try:
+        if deployment_name.startswith("insitu-upload"):
+            dsid = backend.get_or_create_insitu_dataset(
+                file_path=session_folder_path,
+                orcid=orcid,
+                project_id=project_id,
+                kw_list=kw_list,
+                comments=comments,
+            )
+        else:
+            _, dsid = backend.create_session(
+                session_folder_path=session_folder_path,
+                kw_list=kw_list,
+                comments=comments,
+                orcid=orcid,
+                project_id=project_id,
+                instrument_name=instrument_name,
+                sample_unique_id=sample_unique_id,
+                session_dsid=session_dsid,
+            )
+    except Exception as e:
+        backend.logger.error(e)
+        return jsonify({"error": str(e)}), 500
 
     try:
         from prefect.deployments import run_deployment
@@ -191,40 +219,19 @@ def do_upload():
                 "project_id": project_id,
                 "orcid": orcid,
                 "sample_unique_id": sample_unique_id,
-                "session_dsid": session_dsid,
+                "session_dsid": dsid,
                 "kw_list": kw_list,
                 "comments": comments,
             },
-            timeout=0,  # return immediately, monitor in Prefect UI
+            timeout=0,
         )
-        return jsonify({"flow_run_id": str(flow_run.id), "project_id": project_id})
+        return jsonify({
+            "flow_run_id": str(flow_run.id),
+            "project_id": project_id,
+            "dsid": dsid,
+        })
     except Exception as e:
         backend.logger.error(e)
-        return jsonify({"error": str(e)}), 500
-
-
-@app.get("/api/flow-run/<flow_run_id>")
-def flow_run_status(flow_run_id):
-    from prefect.client.orchestration import get_client
-    from pathlib import Path
-    import asyncio
-
-    async def _get_status():
-        async with get_client() as prefect_client:
-            flow_run = await prefect_client.read_flow_run(flow_run_id)
-            return {
-                "status": flow_run.state.type.value,
-                "name": flow_run.state.name,
-            }
-
-    try:
-        result = asyncio.run(_get_status())
-        # Read persisted result from shared file
-        result_file = Path(".flow_results") / flow_run_id
-        if result_file.exists():
-            result["result"] = result_file.read_text()
-        return jsonify(result)
-    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 

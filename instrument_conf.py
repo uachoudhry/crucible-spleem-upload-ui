@@ -7,3 +7,5 @@ PRINT_BARCODE_ENABLED = False
 INSTRUMENT_FLOWS = {
     "qspleem_microscope": "spleem-session-upload/spleem-session-upload",
 }
+
+ACCEPTABLE_FILE_TYPES = {'.h5', '.tif', '.tiff', '.png', '.csv', '.txt'}
