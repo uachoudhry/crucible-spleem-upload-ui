@@ -1,5 +1,7 @@
 DEFAULT_BROWSE_DIR = ""  # Set to a path like "/data/sessions" to default the file picker
-IS_SESSION = True # Set to False if the instrument doesn't have sessions, and files are uploaded directly as datasets
+# True  = pick a folder; create parent session dataset + one child dataset per file inside
+# False = pick one or more files; each becomes its own standalone dataset (or insitu, per instrument)
+IS_SESSION = True
 INSTRUMENTS=["titanx", "themis", "team1",  "team05", 'spectre', "insitu_pl"] # you can add your instrument here
 DEFAULT_INSTRUMENT_NAME = 'titanx'
 

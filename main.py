@@ -30,7 +30,9 @@ _browse_result: queue.Queue = queue.Queue()
 
 
 def _check_browse_queue():
-    """Called repeatedly on the main thread via tkinter's event loop."""
+    """Called repeatedly on the main thread via tkinter's event loop.
+    Always returns a list of paths via _browse_result so the API has a uniform shape.
+    """
     try:
         _browse_request.get_nowait()
         if IS_SESSION:
@@ -38,12 +40,13 @@ def _check_browse_queue():
             if DEFAULT_BROWSE_DIR:
                 kwargs["initialdir"] = DEFAULT_BROWSE_DIR
             path = filedialog.askdirectory(**kwargs)
+            paths = [path] if path else []
         else:
-            kwargs = {"master": _tk_root, "title": "Select file"}
+            kwargs = {"master": _tk_root, "title": "Select file(s)"}
             if DEFAULT_BROWSE_DIR:
                 kwargs["initialdir"] = DEFAULT_BROWSE_DIR
-            path = filedialog.askopenfilename(**kwargs)
-        _browse_result.put(path or "")
+            paths = list(filedialog.askopenfilenames(**kwargs))
+        _browse_result.put(paths)
     except queue.Empty:
         pass
     _tk_root.after(50, _check_browse_queue)
@@ -56,15 +59,19 @@ def index():
 
 @app.get("/api/instruments")
 def get_instruments():
-    return jsonify({"instruments": INSTRUMENTS, "default": DEFAULT_INSTRUMENT_NAME})
+    return jsonify({
+        "instruments": INSTRUMENTS,
+        "default": DEFAULT_INSTRUMENT_NAME,
+        "is_session": IS_SESSION,
+    })
 
 
 @app.get("/api/browse")
 def browse():
     # Signal the main thread to open the dialog, then wait for the result.
     _browse_request.put(True)
-    path = _browse_result.get(timeout=60)
-    return jsonify({"path": path})
+    paths = _browse_result.get(timeout=60)
+    return jsonify({"paths": paths})
 
 
 @app.post("/api/user/lookup")
@@ -164,8 +171,8 @@ def session_check():
 @app.post("/api/upload")
 def do_upload():
     data = request.json or {}
-    required = ["orcid", "project_id", "instrument_name", "session_folder_path"]
-    missing = [f for f in required if not data.get(f, "").strip()]
+    required = ["orcid", "project_id", "instrument_name"]
+    missing = [f for f in required if not (data.get(f) or "").strip()]
     if missing:
         return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
 
@@ -174,27 +181,28 @@ def do_upload():
     instrument_name = data["instrument_name"].strip()
     sample_unique_id = data.get("sample_unique_id", None)
     session_dsid = data.get("session_dsid", None)
-    session_folder_path = data["session_folder_path"].strip()
     comments = data.get("comments", "").strip()
     kw_list = data.get("keywords", []) or extract_keywords(comments, instrument_name)
 
-    deployment_name = INSTRUMENT_FLOWS.get(instrument_name)
-    if not deployment_name:
-        return jsonify({"error": f"No upload flow configured for instrument '{instrument_name}'"}), 400
+    # Non-session mode: caller sends a list of file paths; session mode: a single folder path.
+    if IS_SESSION:
+        session_folder_path = (data.get("session_folder_path") or "").strip()
+        if not session_folder_path:
+            return jsonify({"error": "Missing field: session_folder_path"}), 400
+    else:
+        session_folder_paths = data.get("session_folder_paths") or []
+        if not session_folder_paths:
+            return jsonify({"error": "Missing field: session_folder_paths"}), 400
 
-    # Create the session/dataset record synchronously so the UI can show the
-    # Crucible link + QR code immediately. The Prefect flow then handles the
-    # long-running file upload work against the already-created dsid.
-    try:
-        if deployment_name.startswith("insitu-upload"):
-            dsid = backend.get_or_create_insitu_dataset(
-                file_path=session_folder_path,
-                orcid=orcid,
-                project_id=project_id,
-                kw_list=kw_list,
-                comments=comments,
-            )
-        else:
+    from prefect.deployments import run_deployment
+
+    if IS_SESSION:
+        # Session mode — existing behavior. Create parent session record sync so
+        # the UI can show the Crucible link + QR before the flow runs.
+        deployment_name = INSTRUMENT_FLOWS.get(instrument_name)
+        if not deployment_name:
+            return jsonify({"error": f"No upload flow configured for instrument '{instrument_name}'"}), 400
+        try:
             _, dsid = backend.create_session(
                 session_folder_path=session_folder_path,
                 kw_list=kw_list,
@@ -205,21 +213,84 @@ def do_upload():
                 sample_unique_id=sample_unique_id,
                 session_dsid=session_dsid,
             )
-    except Exception as e:
-        backend.logger.error(e)
-        return jsonify({"error": str(e)}), 500
+        except Exception as e:
+            backend.logger.error(e)
+            return jsonify({"error": str(e)}), 500
+        try:
+            flow_run = run_deployment(
+                deployment_name,
+                parameters={
+                    "file": session_folder_path,
+                    "instrument_name": instrument_name,
+                    "project_id": project_id,
+                    "orcid": orcid,
+                    "sample_unique_id": sample_unique_id,
+                    "session_dsid": dsid,
+                    "kw_list": kw_list,
+                    "comments": comments,
+                },
+                timeout=0,
+            )
+            return jsonify({
+                "flow_run_id": str(flow_run.id),
+                "project_id": project_id,
+                "dsid": dsid,
+            })
+        except Exception as e:
+            backend.logger.error(e)
+            return jsonify({"error": str(e)}), 500
 
+    # Non-session mode: each selected file becomes its own dataset.
+    # - Single file (insitu or not): sync SHA lookup so the UI gets the dsid
+    #   (existing or fresh mfid) immediately; always fire the flow.
+    # - N>1 insitu: loop per file (insitu is rarely multi-file, no bulk path).
+    # - N>1 non-insitu: one multi_file_upload run that builds the SHA map once
+    #   and fans out internally; UI shows the project page.
+    is_insitu = INSTRUMENT_FLOWS.get(instrument_name, "").startswith("insitu-upload")
+
+    if len(session_folder_paths) == 1 or is_insitu:
+        deployment_name = "insitu-upload/insitu-upload" if is_insitu else "upload-dataset/upload-dataset"
+        try:
+            results = []
+            for path in session_folder_paths:
+                dsid, _ = backend.resolve_dsid_for_file(path)
+                flow_run = run_deployment(
+                    deployment_name,
+                    parameters={
+                        "files": [path],
+                        "dsid": dsid,
+                        "instrument_name": instrument_name,
+                        "project_id": project_id,
+                        "orcid": orcid,
+                        "sample_unique_id": sample_unique_id,
+                        "kw_list": kw_list,
+                        "comments": comments,
+                    },
+                    timeout=0,
+                )
+                results.append({"dsid": dsid, "flow_run_id": str(flow_run.id)})
+        except Exception as e:
+            backend.logger.error(e)
+            return jsonify({"error": str(e)}), 500
+        if len(results) == 1:
+            return jsonify({
+                "flow_run_id": results[0]["flow_run_id"],
+                "project_id": project_id,
+                "dsid": results[0]["dsid"],
+            })
+        return jsonify({"project_id": project_id, "uploads": results})
+
+    # Generic multi-file path: fire one multi_file_upload run; it handles SHA
+    # dedup and fans out per-file upload_dataset sub-flows.
     try:
-        from prefect.deployments import run_deployment
         flow_run = run_deployment(
-            deployment_name,
+            "multi-file-upload/multi-file-upload",
             parameters={
-                "file": session_folder_path,
+                "files": session_folder_paths,
                 "instrument_name": instrument_name,
                 "project_id": project_id,
                 "orcid": orcid,
                 "sample_unique_id": sample_unique_id,
-                "session_dsid": dsid,
                 "kw_list": kw_list,
                 "comments": comments,
             },
@@ -228,7 +299,6 @@ def do_upload():
         return jsonify({
             "flow_run_id": str(flow_run.id),
             "project_id": project_id,
-            "dsid": dsid,
         })
     except Exception as e:
         backend.logger.error(e)

@@ -134,16 +134,19 @@
       </div>
     </div>
 
-    <!-- Row 2: Session -->
+    <!-- Row 2: Session / Files -->
     <div class="card shadow-sm mb-4">
       <div class="card-body">
-        <h5 class="card-title text-primary mb-3">Session</h5>
-        <div class="input-group mb-3">
+        <h5 id="session-card-title" class="card-title text-primary mb-3">Session</h5>
+        <div class="input-group mb-2">
           <input id="session-folder" type="text" class="form-control"
                  placeholder="No folder selected — click Browse"
                  readonly style="background:#e9ecef;" />
-          <button class="btn btn-outline-secondary" onclick="browseFolder()">Browse…</button>
+          <button id="btn-browse" class="btn btn-outline-secondary" onclick="browseFolder()">Browse…</button>
         </div>
+        <!-- Shown only in non-session mode when 2+ files are selected. -->
+        <ul id="selected-files-list" class="list-group list-group-flush small mb-3 d-none"
+            style="max-height: 180px; overflow-y: auto;"></ul>
         <label class="form-label fw-semibold">Comments</label>
         <div class="d-flex gap-2">
           <button id="btn-voice" class="btn btn-outline-secondary align-self-start" type="button"
@@ -154,7 +157,7 @@
             </svg>
           </button>
           <textarea id="comments" class="form-control" rows="3"
-                    placeholder="Any notes about this session (optional)..."></textarea>
+                    placeholder="Any notes about this upload (optional)..."></textarea>
         </div>
         <small id="voice-status" class="form-text text-muted d-none">Listening...</small>
 
@@ -196,7 +199,7 @@
           <!-- Submitting spinner (visible briefly while POST /api/upload is in flight) -->
           <div id="submitting-section" class="text-center py-3">
             <div class="spinner-border text-primary" role="status"></div>
-            <p class="mt-3 mb-0 text-muted">Creating session and starting upload...</p>
+            <p class="mt-3 mb-0 text-muted">Starting upload...</p>
           </div>
           <!-- Success view (shown as soon as the API returns the dsid) -->
           <div id="success-section" class="text-center d-none">
@@ -288,6 +291,8 @@
     const state = {
       orcid: "",
       projects: [],
+      isSession: true,
+      selectedPaths: [],
     };
 
     // -------------------------------------------------------------------------
@@ -306,6 +311,9 @@
       if (data.default) {
         sel.value = data.default;
       }
+
+      state.isSession = !!data.is_session;
+      applyUploadModeUI();
 
       // Auto-populate from query params (e.g. ?user_email=xx&project=xx)
       const params = new URLSearchParams(window.location.search);
@@ -513,13 +521,58 @@
     // -------------------------------------------------------------------------
     // Browse
     // -------------------------------------------------------------------------
+    function applyUploadModeUI() {
+      const title = document.getElementById("session-card-title");
+      const folderInput = document.getElementById("session-folder");
+      const browseBtn = document.getElementById("btn-browse");
+      if (state.isSession) {
+        title.textContent = "Session";
+        folderInput.placeholder = "No folder selected — click Browse";
+        browseBtn.textContent = "Browse Folder…";
+      } else {
+        title.textContent = "Files";
+        folderInput.placeholder = "No files selected — click Browse";
+        browseBtn.textContent = "Browse Files…";
+      }
+    }
+
+    function renderSelectedFiles() {
+      const list = document.getElementById("selected-files-list");
+      const folderInput = document.getElementById("session-folder");
+      const paths = state.selectedPaths;
+
+      if (state.isSession) {
+        folderInput.value = paths[0] || "";
+        list.classList.add("d-none");
+        return;
+      }
+
+      // Non-session: input always shows count; the list shows basenames when 2+ files.
+      if (paths.length === 0) {
+        folderInput.value = "";
+        list.innerHTML = "";
+        list.classList.add("d-none");
+      } else if (paths.length === 1) {
+        folderInput.value = paths[0];
+        list.innerHTML = "";
+        list.classList.add("d-none");
+      } else {
+        folderInput.value = `${paths.length} files selected`;
+        list.innerHTML = paths
+          .map(p => `<li class="list-group-item py-1 px-2">${p.split(/[\\/]/).pop()}</li>`)
+          .join("");
+        list.classList.remove("d-none");
+      }
+    }
+
     async function browseFolder() {
       try {
         const res = await fetch("/api/browse");
         const data = await res.json();
-        if (data.path) document.getElementById("session-folder").value = data.path;
+        state.selectedPaths = data.paths || [];
+        renderSelectedFiles();
       } catch (e) {
-        showStatus("Folder browse failed: " + e.message, "danger");
+        showStatus("Browse failed: " + e.message, "danger");
       }
     }
 
@@ -563,14 +616,14 @@
       const orcid = state.orcid;
       const project_id = document.getElementById("project").value;
       const instrument_name = document.getElementById("instrument").value;
-      const session_folder_path = document.getElementById("session-folder").value.trim();
 
       const missing = [];
 
       if (!orcid) missing.push("email (look up user first)");
       if (!project_id) missing.push("project");
       if (!instrument_name) missing.push("instrument");
-      if (!session_folder_path) missing.push("session folder");
+      if (state.isSession && !state.selectedPaths[0]) missing.push("session folder");
+      if (!state.isSession && state.selectedPaths.length === 0) missing.push("file(s)");
 
       if (missing.length) {
         showStatus("Please fill in: " + missing.join(", ") + ".", "danger");
@@ -584,43 +637,50 @@
         orcid,
         project_id,
         instrument_name,
-        session_folder_path,
         sample_unique_id: document.getElementById("sample-uid").value.trim() || null,
         comments: document.getElementById("comments").value.trim(),
         keywords: getKeywords(),
       };
+      if (state.isSession) {
+        uploadParams.session_folder_path = state.selectedPaths[0];
+      } else {
+        uploadParams.session_folder_paths = state.selectedPaths;
+      }
 
-      try {
-        const checkRes = await fetch("/api/session/check", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(uploadParams),
-        });
-        const checkData = await checkRes.json();
+      // Session-check only matters for session mode (it's looking up a folder-named parent dataset).
+      if (state.isSession) {
+        try {
+          const checkRes = await fetch("/api/session/check", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(uploadParams),
+          });
+          const checkData = await checkRes.json();
 
-        if (checkRes.ok && checkData.sessions) {
-          if (checkData.sessions.length === 1) {
-            _selectedSessionDsid = checkData.sessions[0].unique_id;
-          } else if (checkData.sessions.length > 1) {
-            _pendingUploadParams = uploadParams;
-            const listEl = document.getElementById("session-list");
-            listEl.innerHTML = "";
-            checkData.sessions.forEach((s, i) => {
-              const label = s.dataset_name + (s.creation_time ? ` (created: ${s.creation_time})` : "");
-              listEl.innerHTML += `
-                <label class="list-group-item d-flex align-items-center">
-                  <input type="radio" name="session-choice" class="form-check-input me-2" value="${s.unique_id}" ${i === 0 ? "checked" : ""} />
-                  <span>${label}</span>
-                </label>`;
-            });
-            const modal = new bootstrap.Modal(document.getElementById("select-session-modal"));
-            modal.show();
-            return;
+          if (checkRes.ok && checkData.sessions) {
+            if (checkData.sessions.length === 1) {
+              _selectedSessionDsid = checkData.sessions[0].unique_id;
+            } else if (checkData.sessions.length > 1) {
+              _pendingUploadParams = uploadParams;
+              const listEl = document.getElementById("session-list");
+              listEl.innerHTML = "";
+              checkData.sessions.forEach((s, i) => {
+                const label = s.dataset_name + (s.creation_time ? ` (created: ${s.creation_time})` : "");
+                listEl.innerHTML += `
+                  <label class="list-group-item d-flex align-items-center">
+                    <input type="radio" name="session-choice" class="form-check-input me-2" value="${s.unique_id}" ${i === 0 ? "checked" : ""} />
+                    <span>${label}</span>
+                  </label>`;
+              });
+              const modal = new bootstrap.Modal(document.getElementById("select-session-modal"));
+              modal.show();
+              return;
+            }
           }
+        } catch (e) {
+          showStatus("Session check failed: " + e.message, "danger");
+          return;
         }
-      } catch (e) {
-        showStatus("Session check failed: " + e.message, "danger");
-        return;
       }
 
       startUploadRequest(uploadParams);
@@ -650,19 +710,24 @@
         document.getElementById("submitting-section").classList.add("d-none");
 
         if (res.ok) {
-          document.getElementById("upload-modal-title").textContent = "Session created — upload running";
+          const isSingleDataset = !!data.dsid;
+          document.getElementById("upload-modal-title").textContent =
+            isSingleDataset ? "Dataset created — upload running" : "Upload running";
           document.getElementById("upload-modal-header").classList.add("bg-success", "text-white");
           document.getElementById("success-section").classList.remove("d-none");
 
           const prefectUrl = "http://127.0.0.1:4200/flow-runs/flow-run/" + data.flow_run_id;
           document.getElementById("prefect-link").href = prefectUrl;
 
+          // Per-dataset link for session/single-insitu; project page link for multi.
           const crucibleBaseUrl = "https://crucible-graph-explorer-776258882599.us-central1.run.app";
-          const datasetUrl = crucibleBaseUrl + "/" + data.project_id + "/datasets/" + data.dsid;
-          document.getElementById("crucible-link").href = datasetUrl;
+          const linkUrl = isSingleDataset
+            ? `${crucibleBaseUrl}/${data.project_id}/datasets/${data.dsid}`
+            : `${crucibleBaseUrl}/${data.project_id}/#tab=datasets`;
+          document.getElementById("crucible-link").href = linkUrl;
           const qrContainer = document.getElementById("qr-code");
           qrContainer.innerHTML = "";
-          new QRCode(qrContainer, { text: datasetUrl, width: 256, height: 256 });
+          new QRCode(qrContainer, { text: linkUrl, width: 256, height: 256 });
         } else {
           document.getElementById("upload-modal-title").textContent = "Upload Failed";
           document.getElementById("upload-modal-header").classList.add("bg-danger", "text-white");
@@ -700,7 +765,8 @@
       document.getElementById("sample-name").value = "";
       document.getElementById("sample-uid").value = "";
       document.getElementById("description").value = "";
-      document.getElementById("session-folder").value = "";
+      state.selectedPaths = [];
+      renderSelectedFiles();
       document.getElementById("comments").value = "";
       if (typeof _keywords !== "undefined") {
         _keywords = [];
@@ -741,7 +807,8 @@
     document.getElementById("upload-modal").addEventListener("hidden.bs.modal", function () {
       _pendingUploadParams = null;
       _selectedSessionDsid = null;
-      document.getElementById("session-folder").value = "";
+      state.selectedPaths = [];
+      renderSelectedFiles();
       document.getElementById("sample-name").value = "";
       document.getElementById("sample-uid").value = "";
       document.getElementById("description").value = "";

@@ -227,36 +227,19 @@ def create_session(session_folder_path: str, kw_list: list[str], comments: str, 
     return session_name, use_session_dsid
 
 
-def get_or_create_insitu_dataset(file_path: str, orcid: str, project_id: str,
-                                 kw_list: list[str], comments: str) -> str:
-    """Return the dsid of an existing insitu dataset for this file/user/project,
-    creating an empty one if none exists. Used by /api/upload to obtain a dsid
-    synchronously so the UI can show the Crucible link before the flow runs.
+def resolve_dsid_for_file(file_path: str) -> tuple[str, bool]:
+    """Look up a file's SHA256 in Crucible. If a dataset already contains this
+    file, return (existing_dsid, True). Otherwise generate a fresh mfid and
+    return (new_dsid, False). Used by /api/upload for single-file paths so the
+    UI gets a dsid synchronously.
     """
-    project_id = project_id.replace('Internal Research (', '').replace(')', '').strip()
-    dataset_name = Path(file_path).name
-
-    existing = client.datasets.list(
-        dataset_name=dataset_name,
-        owner_orcid=orcid,
-        project_id=project_id,
-        limit=None,
-    )
-    found_dsid = None
-    if existing:
-        existing.sort(key=lambda d: d.get('modification_time') or '', reverse=True)
-        found_dsid = existing[0]['unique_id']
-
-    ds_kwargs = {k: v for k, v in dict(
-        unique_id=found_dsid,
-        dataset_name=dataset_name,
-        owner_orcid=orcid,
-        project_id=project_id,
-    ).items() if v is not None}
-    ds = BaseDataset(**ds_kwargs)
-    scimd = {'comments': comments} if comments else {}
-    new_ds = client.datasets.create(ds, scientific_metadata=scimd, keywords=kw_list)
-    return new_ds['created_record']['unique_id']
+    import mfid
+    sha = _compute_sha256(file_path)
+    for f in client.files.list_files(sha256_hash=sha):
+        existing_dsid = f.get('dataset_mfid')
+        if existing_dsid:
+            return existing_dsid, True
+    return mfid.mfid()[0], False
 
 
 @task
@@ -300,36 +283,13 @@ def create_dataset(files: list[str],
                    project_id: str | None = None,
                    orcid: str | None = None,
                    session_name: str | None = None,
+                   dsid: str | None = None,
                    kw_list: list[str] = [],
                    comments: str | None = None) -> str:
     logger = get_run_logger()
 
-    # Dedup + retry resume: for each file, check if an associated file with the
-    # same SHA256 already exists in a dataset for this session. If found, pass
-    # that unique_id to BaseDataset so datasets.create() runs against the existing
-    # record — the file upload is skipped (SHA256 dedup in _upload_file_gcs) and
-    # any previously failed steps (metadata, keywords, links) are retried.
-    found_dsid = None
-    for file_path in files:
-        file_sha256 = _compute_sha256(file_path)
-        logger.info(f"SHA256 for {Path(file_path).name}: {file_sha256}")
-        for file_rec in client.files.list_files(sha256_hash=file_sha256):
-            dsid = file_rec.get('dataset_mfid')
-            if not dsid:
-                continue
-            ds = client.datasets.get(dsid)
-            if (ds
-                    and ds.get('session_name') == session_name
-                    and ds.get('project_id') == project_id
-                    and ds.get('owner_orcid') == orcid):
-                found_dsid = dsid
-                logger.info(f"File {Path(file_path).name} already in dataset {found_dsid}; resuming")
-                break
-        if found_dsid:
-            break
-
     ds_kwargs = {k: v for k, v in dict(
-        unique_id=found_dsid,
+        unique_id=dsid,
         owner_orcid=orcid,
         project_id=project_id,
         instrument_name=instrument_name,
@@ -345,7 +305,7 @@ def create_dataset(files: list[str],
         wait_for_ingestion_response=True,
     )
     new_ds_dsid = new_ds['created_record']['unique_id']
-    logger.info(f"{'Resumed' if found_dsid else 'Created'} dataset {new_ds_dsid} for {', '.join(Path(f).name for f in files)}")
+    logger.info(f"{'Resumed' if dsid else 'Created'} dataset {new_ds_dsid} for {', '.join(Path(f).name for f in files)}")
     return new_ds_dsid
 
 
@@ -380,45 +340,57 @@ def _run_name(prefix):
     return generate
 
 
-@task(retries=3, retry_delay_seconds=10)
-def add_file_to_insitu_dataset(dsid: str, file_path: str) -> None:
-    client.datasets.add_file_to_dataset(
-        dsid=dsid, file_path=file_path, wait_for_ingestion_response=True,
-    )
-
-
-# flow to upload an insitu dataset (dataset record pre-created by /api/upload)
+# flow to upload an insitu dataset — same as upload_dataset but also requests
+# insitu aggregation after the file lands.
 @flow(flow_run_name=_run_name("insitu-upload"))
-def insitu_upload(file: str,
+def insitu_upload(files: list,
                   instrument_name: str,
                   project_id: str,
                   orcid: str,
-                  sample_unique_id: str | None = None,
+                  session_name: str | None = None,
                   session_dsid: str | None = None,
+                  dsid: str | None = None,
+                  sample_unique_id: str | None = None,
                   kw_list: list[str] = [],
                   comments: str | None = None) -> str:
 
-    add_file_to_insitu_dataset(session_dsid, file)
-    request_insitu_aggregation(session_dsid)
-    return session_dsid
-
-# sub flow to upload a dataset as the child of a session
-@flow(flow_run_name=_run_name("upload"))
-def upload_child_dataset(files: list,
-                         instrument_name: str,
-                         project_id: str,
-                         orcid: str,
-                         session_name: str,
-                         session_dsid: str,
-                         sample_unique_id: str | None = None,
-                         kw_list: list[str] = [],
-                         comments: str | None = None) -> str:
-    
-    new_ds_dsid = create_dataset(files = files,
-                                 instrument_name = instrument_name,
+    new_ds_dsid = create_dataset(files=files,
+                                 instrument_name=instrument_name,
                                  project_id=project_id,
                                  orcid=orcid,
                                  session_name=session_name,
+                                 dsid=dsid,
+                                 kw_list=kw_list,
+                                 comments=comments)
+
+    link_dataset_to_session(new_ds_dsid, session_dsid)
+    link_dataset_and_sample(new_ds_dsid, sample_unique_id)
+    request_insitu_aggregation(new_ds_dsid)
+    return new_ds_dsid
+
+# Generic per-dataset upload flow. Used both for session children (session_dsid +
+# session_name passed; dsid left None so create_dataset's SHA dedup runs) and for
+# standalone multi-file uploads (dsid pre-assigned by multi_file_upload after its
+# own SHA check; session_dsid/session_name left None so link_dataset_to_session
+# is a no-op).
+@flow(flow_run_name=_run_name("upload"))
+def upload_dataset(files: list,
+                   instrument_name: str,
+                   project_id: str,
+                   orcid: str,
+                   session_name: str | None = None,
+                   session_dsid: str | None = None,
+                   dsid: str | None = None,
+                   sample_unique_id: str | None = None,
+                   kw_list: list[str] = [],
+                   comments: str | None = None) -> str:
+
+    new_ds_dsid = create_dataset(files=files,
+                                 instrument_name=instrument_name,
+                                 project_id=project_id,
+                                 orcid=orcid,
+                                 session_name=session_name,
+                                 dsid=dsid,
                                  kw_list=kw_list,
                                  comments=comments)
 
@@ -433,6 +405,7 @@ def tem_session_upload(file: str, instrument_name: str, project_id: str, orcid: 
                        kw_list: list[str] = [], comments: str | None = None) -> str:
     import time
     import os
+    import mfid
     import requests as req
     from prefect.deployments import run_deployment
     logger = get_run_logger()
@@ -448,10 +421,14 @@ def tem_session_upload(file: str, instrument_name: str, project_id: str, orcid: 
         orcid, project_id, instrument_name, sample_unique_id,
         session_dsid=session_dsid)
 
-    # returns list of files in folder path that are less than 20GB 
+    # returns list of files in folder path that are less than 20GB
     # with an accepted file type
     session_files = identify_session_files(session_folder_path)
     logger.info(f'{session_files=}')
+
+    sha_to_dsid = build_existing_sha_map(orcid, project_id)
+    logger.info(f"Found {len(sha_to_dsid)} existing files for user+project")
+
     # Submit all child flows in parallel (timeout=0 returns immediately)
     child_runs = []
     for f in session_files:
@@ -460,10 +437,15 @@ def tem_session_upload(file: str, instrument_name: str, project_id: str, orcid: 
         if f.endswith('ser'):
             dsfiles.append(get_emi_file_name(f))
 
+        sha = _compute_sha256(f)
+        dsid = sha_to_dsid.get(sha) or mfid.mfid()[0]
+        logger.info(f"{Path(f).name}: {'reusing existing' if sha in sha_to_dsid else 'new'} dsid {dsid}")
+
         run = run_deployment(
-            "upload-child-dataset/upload-child-dataset",
+            "upload-dataset/upload-dataset",
             parameters={
                 "files": dsfiles,
+                "dsid": dsid,
                 "instrument_name": instrument_name,
                 "project_id": project_id,
                 "orcid": orcid,
@@ -507,4 +489,72 @@ def tem_session_upload(file: str, instrument_name: str, project_id: str, orcid: 
         logger.error(f"{len(failed)} child flow(s) failed. Retry them from the Prefect UI.")
 
     return session_dsid
+
+
+@task
+def build_existing_sha_map(orcid: str, project_id: str) -> dict[str, str]:
+    """Pull every file for this user+project once and return a {sha256: dsid} map.
+    Used by multi_file_upload to dedup against existing datasets before generating
+    fresh mfids — files whose SHA is already in the map reuse the existing dsid.
+    """
+    project_id = project_id.replace('Internal Research (', '').replace(')', '').strip()
+    sha_to_dsid: dict[str, str] = {}
+    for f in client.files.list_files(owner_orcid=orcid, project_id=project_id):
+        sha = f.get('sha256_hash')
+        dsid = f.get('dataset_mfid')
+        if sha and dsid:
+            sha_to_dsid.setdefault(sha, dsid)
+    return sha_to_dsid
+
+
+# flow to upload N standalone files, each as its own dataset. SHA dedup happens
+# once up-front against all of the user's existing files in this project; then
+# one upload-dataset sub-flow is fired per file with either the existing dsid
+# (already uploaded — sub-flow no-ops) or a fresh mfid-generated dsid.
+@flow(flow_run_name=_run_name("multi-file-upload"))
+def multi_file_upload(files: list[str],
+                      instrument_name: str,
+                      project_id: str,
+                      orcid: str,
+                      sample_unique_id: str | None = None,
+                      kw_list: list[str] = [],
+                      comments: str | None = None) -> list[str]:
+    import time
+    import mfid
+    from prefect.deployments import run_deployment
+    logger = get_run_logger()
+
+    sha_to_dsid = build_existing_sha_map(orcid, project_id)
+    logger.info(f"Found {len(sha_to_dsid)} existing files for user+project")
+
+    submitted = []
+    for f in files:
+        sha = _compute_sha256(f)
+        existing_dsid = sha_to_dsid.get(sha)
+        if existing_dsid:
+            dsid = existing_dsid
+            logger.info(f"{Path(f).name}: SHA matches existing dataset {dsid}; sub-flow will resume/no-op")
+        else:
+            dsid = mfid.mfid()[0]
+            logger.info(f"{Path(f).name}: new dataset, assigned dsid {dsid}")
+
+        time.sleep(0.3)
+        run = run_deployment(
+            "upload-dataset/upload-dataset",
+            parameters={
+                "files": [f],
+                "dsid": dsid,
+                "instrument_name": instrument_name,
+                "project_id": project_id,
+                "orcid": orcid,
+                "sample_unique_id": sample_unique_id,
+                "kw_list": kw_list,
+                "comments": comments,
+            },
+            timeout=0,
+        )
+        submitted.append(dsid)
+        logger.info(f"Submitted upload-dataset flow for {Path(f).name}: {run.id}")
+
+    return submitted
 
