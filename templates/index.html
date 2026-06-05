@@ -25,7 +25,10 @@
   <nav class="navbar navbar-dark bg-primary mb-4">
     <div class="container-fluid">
       <span class="navbar-brand fw-semibold">Crucible Upload</span>
-      <button class="btn btn-outline-light btn-sm" type="button" onclick="logout()">Log out</button>
+      <div class="d-flex gap-2">
+        <button class="btn btn-outline-light btn-sm" type="button" onclick="openConfig()">&#9881; Config</button>
+        <button class="btn btn-outline-light btn-sm" type="button" onclick="logout()">Log out</button>
+      </div>
     </div>
   </nav>
 
@@ -277,6 +280,94 @@
           <button type="button" class="btn btn-primary" onclick="submitCreateSample()">
             <span id="spinner-create-sample" class="spinner-border spinner-border-sm d-none me-1" role="status"></span>
             Create Sample
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Instrument Config Modal -->
+  <div class="modal fade" id="config-modal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Instrument Configuration</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small">
+            Edits are written to <code>instrument_conf.py</code>. The page reloads on save so changes take effect.
+          </p>
+
+          <!-- Mode -->
+          <label class="form-label fw-semibold">Upload mode</label>
+          <select id="cfg-is-session" class="form-select mb-3">
+            <option value="true">Session — pick a folder</option>
+            <option value="false">Files — pick one or more files</option>
+          </select>
+
+          <!-- Default browse dir -->
+          <label class="form-label fw-semibold">Default browse directory</label>
+          <input id="cfg-browse-dir" type="text" class="form-control mb-3" placeholder="(none) — e.g. /data/sessions" />
+
+          <!-- Instruments -->
+          <label class="form-label fw-semibold">Instruments</label>
+          <div id="cfg-instruments" class="d-flex flex-wrap gap-1 mb-2"></div>
+          <div class="input-group input-group-sm mb-3" style="max-width: 320px;">
+            <input id="cfg-instrument-input" type="text" class="form-control" placeholder="Add instrument..."
+                   onkeydown="if(event.key==='Enter'){event.preventDefault(); addInstrumentChip()}" />
+            <button class="btn btn-outline-secondary" type="button" onclick="addInstrumentChip()">+</button>
+          </div>
+
+          <!-- Default instrument -->
+          <label class="form-label fw-semibold">Default instrument</label>
+          <select id="cfg-default-instrument" class="form-select mb-3"></select>
+
+          <!-- Instrument flows -->
+          <label class="form-label fw-semibold">Instrument flows
+            <span class="text-muted small fw-normal">— instrument → Prefect deployment (session mode)</span>
+          </label>
+          <div id="cfg-flows" class="mb-2"></div>
+          <button class="btn btn-outline-secondary btn-sm mb-3" type="button" onclick="addFlowRow()">+ Add flow</button>
+
+          <!-- Post-processing requests -->
+          <label class="form-label fw-semibold">Post-processing requests
+            <span class="text-muted small fw-normal">— instrument → comma-separated request names</span>
+          </label>
+          <div id="cfg-postproc" class="mb-2"></div>
+          <button class="btn btn-outline-secondary btn-sm mb-3" type="button" onclick="addPostProcRow()">+ Add post-processing</button>
+
+          <!-- Acceptable file types -->
+          <label class="form-label fw-semibold">Acceptable file types</label>
+          <div id="cfg-filetypes" class="d-flex flex-wrap gap-1 mb-2"></div>
+          <div class="input-group input-group-sm mb-3" style="max-width: 320px;">
+            <input id="cfg-filetype-input" type="text" class="form-control" placeholder="Add extension e.g. .emd"
+                   onkeydown="if(event.key==='Enter'){event.preventDefault(); addFileTypeChip()}" />
+            <button class="btn btn-outline-secondary" type="button" onclick="addFileTypeChip()">+</button>
+          </div>
+
+          <!-- Toggles -->
+          <div class="form-check form-switch mb-2">
+            <input class="form-check-input" type="checkbox" id="cfg-chain-postproc" />
+            <label class="form-check-label" for="cfg-chain-postproc">Chain post-processing (run sequentially)</label>
+          </div>
+          <div class="form-check form-switch mb-2">
+            <input class="form-check-input" type="checkbox" id="cfg-print-barcode" />
+            <label class="form-check-label" for="cfg-print-barcode">Enable barcode printing</label>
+          </div>
+
+          <div class="alert alert-warning small mb-0 mt-3">
+            Note: <code>POST_PROCESSING_REQUESTS</code>, <code>CHAIN_POST_PROCESSING</code>, and
+            <code>ACCEPTABLE_FILE_TYPES</code> are read by the Prefect worker process — restart the worker for those to take effect.
+          </div>
+
+          <div id="cfg-error" class="alert alert-danger d-none mt-3 mb-0"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-primary" onclick="saveConfig()" id="btn-save-config">
+            <span id="spinner-save-config" class="spinner-border spinner-border-sm d-none me-1" role="status"></span>
+            Save &amp; Reload
           </button>
         </div>
       </div>
@@ -802,6 +893,182 @@
 
     function clearStatus() {
       document.getElementById("status-box").innerHTML = "";
+    }
+
+    // -------------------------------------------------------------------------
+    // Instrument config editor
+    // -------------------------------------------------------------------------
+    let configModal = null;
+    const cfgState = { instruments: [], fileTypes: [] };
+
+    async function openConfig() {
+      document.getElementById("cfg-error").classList.add("d-none");
+      try {
+        const res = await fetch("/api/config");
+        const c = await res.json();
+        if (!res.ok) { alert(c.error || "Failed to load config"); return; }
+
+        document.getElementById("cfg-is-session").value = c.IS_SESSION ? "true" : "false";
+        document.getElementById("cfg-browse-dir").value = c.DEFAULT_BROWSE_DIR || "";
+        document.getElementById("cfg-chain-postproc").checked = !!c.CHAIN_POST_PROCESSING;
+        document.getElementById("cfg-print-barcode").checked = !!c.PRINT_BARCODE_ENABLED;
+
+        cfgState.instruments = [...(c.INSTRUMENTS || [])];
+        cfgState.fileTypes = [...(c.ACCEPTABLE_FILE_TYPES || [])];
+        renderInstrumentChips();
+        renderFileTypeChips();
+        updateDefaultInstrumentOptions(c.DEFAULT_INSTRUMENT_NAME || "");
+
+        document.getElementById("cfg-flows").innerHTML = "";
+        Object.entries(c.INSTRUMENT_FLOWS || {}).forEach(([k, v]) => addFlowRow(k, v));
+
+        document.getElementById("cfg-postproc").innerHTML = "";
+        Object.entries(c.POST_PROCESSING_REQUESTS || {}).forEach(([k, v]) => addPostProcRow(k, (v || []).join(", ")));
+
+        if (!configModal) configModal = new bootstrap.Modal(document.getElementById("config-modal"));
+        configModal.show();
+      } catch (e) {
+        alert("Failed to load config: " + e.message);
+      }
+    }
+
+    function chip(label, onRemove) {
+      const span = document.createElement("span");
+      span.className = "badge bg-secondary d-inline-flex align-items-center gap-1";
+      span.textContent = label;
+      const x = document.createElement("button");
+      x.type = "button";
+      x.className = "btn-close btn-close-white";
+      x.style.fontSize = "0.6rem";
+      x.onclick = onRemove;
+      span.appendChild(x);
+      return span;
+    }
+
+    function renderInstrumentChips() {
+      const box = document.getElementById("cfg-instruments");
+      box.innerHTML = "";
+      cfgState.instruments.forEach((name, i) => {
+        box.appendChild(chip(name, () => { cfgState.instruments.splice(i, 1); renderInstrumentChips(); updateDefaultInstrumentOptions(); }));
+      });
+    }
+
+    function addInstrumentChip() {
+      const input = document.getElementById("cfg-instrument-input");
+      const val = input.value.trim();
+      if (val && !cfgState.instruments.includes(val)) {
+        cfgState.instruments.push(val);
+        renderInstrumentChips();
+        updateDefaultInstrumentOptions();
+      }
+      input.value = "";
+    }
+
+    function renderFileTypeChips() {
+      const box = document.getElementById("cfg-filetypes");
+      box.innerHTML = "";
+      cfgState.fileTypes.forEach((ext, i) => {
+        box.appendChild(chip(ext, () => { cfgState.fileTypes.splice(i, 1); renderFileTypeChips(); }));
+      });
+    }
+
+    function addFileTypeChip() {
+      const input = document.getElementById("cfg-filetype-input");
+      let val = input.value.trim();
+      if (val && !val.startsWith(".")) val = "." + val;
+      if (val && !cfgState.fileTypes.includes(val)) {
+        cfgState.fileTypes.push(val);
+        renderFileTypeChips();
+      }
+      input.value = "";
+    }
+
+    function updateDefaultInstrumentOptions(preferred) {
+      const sel = document.getElementById("cfg-default-instrument");
+      const current = preferred !== undefined ? preferred : sel.value;
+      sel.innerHTML = "";
+      cfgState.instruments.forEach(name => {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+      });
+      if (cfgState.instruments.includes(current)) sel.value = current;
+    }
+
+    function dictRow(containerId, keyVal, valVal, valPlaceholder) {
+      const row = document.createElement("div");
+      row.className = "input-group input-group-sm mb-1";
+      row.innerHTML = `
+        <input type="text" class="form-control cfg-key" placeholder="instrument" style="max-width: 180px;" />
+        <input type="text" class="form-control cfg-val" />
+        <button class="btn btn-outline-danger" type="button">&times;</button>`;
+      row.querySelector(".cfg-key").value = keyVal || "";
+      const v = row.querySelector(".cfg-val");
+      v.value = valVal || "";
+      v.placeholder = valPlaceholder;
+      row.querySelector("button").onclick = () => row.remove();
+      document.getElementById(containerId).appendChild(row);
+    }
+
+    function addFlowRow(key, val) { dictRow("cfg-flows", key, val, "flow-name/deployment-name"); }
+    function addPostProcRow(key, val) { dictRow("cfg-postproc", key, val, "request_a, request_b"); }
+
+    function collectDict(containerId, asList) {
+      const out = {};
+      document.querySelectorAll(`#${containerId} .input-group`).forEach(row => {
+        const key = row.querySelector(".cfg-key").value.trim();
+        const raw = row.querySelector(".cfg-val").value.trim();
+        if (!key) return;
+        out[key] = asList ? raw.split(",").map(s => s.trim()).filter(Boolean) : raw;
+      });
+      return out;
+    }
+
+    async function saveConfig() {
+      const errBox = document.getElementById("cfg-error");
+      errBox.classList.add("d-none");
+
+      if (!cfgState.instruments.length) {
+        errBox.textContent = "At least one instrument is required.";
+        errBox.classList.remove("d-none");
+        return;
+      }
+
+      const payload = {
+        IS_SESSION: document.getElementById("cfg-is-session").value === "true",
+        DEFAULT_BROWSE_DIR: document.getElementById("cfg-browse-dir").value.trim(),
+        INSTRUMENTS: cfgState.instruments,
+        DEFAULT_INSTRUMENT_NAME: document.getElementById("cfg-default-instrument").value,
+        INSTRUMENT_FLOWS: collectDict("cfg-flows", false),
+        POST_PROCESSING_REQUESTS: collectDict("cfg-postproc", true),
+        ACCEPTABLE_FILE_TYPES: cfgState.fileTypes,
+        CHAIN_POST_PROCESSING: document.getElementById("cfg-chain-postproc").checked,
+        PRINT_BARCODE_ENABLED: document.getElementById("cfg-print-barcode").checked,
+      };
+
+      document.getElementById("spinner-save-config").classList.remove("d-none");
+      document.getElementById("btn-save-config").disabled = true;
+      try {
+        const res = await fetch("/api/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          errBox.textContent = data.error || "Failed to save config";
+          errBox.classList.remove("d-none");
+          return;
+        }
+        location.reload();
+      } catch (e) {
+        errBox.textContent = "Save failed: " + e.message;
+        errBox.classList.remove("d-none");
+      } finally {
+        document.getElementById("spinner-save-config").classList.add("d-none");
+        document.getElementById("btn-save-config").disabled = false;
+      }
     }
 
     document.getElementById("upload-modal").addEventListener("hidden.bs.modal", function () {

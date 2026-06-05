@@ -15,12 +15,16 @@ All members of the project will then have access to the uploaded data through th
 - **Search for a sample by sample_name or unique_id**
 This will display the sample details and create a relationship between any uploaded datasets and the sample provided.
 
-- **Select a folder from their local file system to upload**
-The name of this folder will be used to create a dataset object in the Crucible platform with a measurement type of the format `{instrument_name} full session`.  From this folder, all supported files* will be uploaded as datasets to the platform and linked as "children" of the session dataset.  They will also be linked to the provided sample, user, and project_id. 
+- **Select data from their local file system to upload**
+Depending on how the app is configured (see `IS_SESSION` under [Additional Details](#additional-details)), the user either selects a folder or selects one or more files:
+    - **Session mode** (folder): the folder name is used to create a `parent dataset` in the Crucible platform with a measurement type of the format `{instrument_name} full session`. All supported files* within the folder are uploaded as datasets and linked as "children" of the session dataset.
+    - **File mode** (one or more files): each selected file becomes its own standalone dataset. No parent session is created.
+
+In all modes, uploaded datasets are linked to the provided sample, user, and project_id. 
 
 Once data is uploaded it can be viewed in the [Crucible Web Explorer](https://crucible-graph-explorer-776258882599.us-central1.run.app/)!
 
-*currently supported files include files smaller than 20GB with one of the following extensions: emd, ser, emi, dm3, dm4, mcr, bcf, and h5
+*In **session mode**, a folder is scanned and only files smaller than 20GB with an accepted extension are uploaded; configure the accepted extensions via `ACCEPTABLE_FILE_TYPES` in `instrument_conf.py` (see [Additional Details](#additional-details)). For each `.ser` file the matching `.emi` is included automatically. In **file mode** the user selects files directly, so this filter does not apply.
 
 ### System requirements
 - internet connection
@@ -69,17 +73,34 @@ bucket_policy_only = true
 5. Run the app!
 
 ### Running the app
+The app runs as three coordinated processes: a local **Prefect server** (orchestration), **`serve_flows.py`** (registers and serves the upload flows as Prefect deployments), and the **Flask UI** (`main.py`). The provided start scripts launch all three together and shut them down on exit.
+
+**macOS / Linux:**
 ```
 cd crucible-tem-upload-ui
-uv run python main.py
+./start.sh
 ```
 
+**Windows:**
+```
+cd crucible-tem-upload-ui
+start.bat
+```
+
+Both scripts set `PREFECT_API_URL=http://127.0.0.1:4200/api`, start the Prefect server, wait for it to come up, start `serve_flows.py`, then run the Flask app in the foreground. The Prefect UI is available at http://127.0.0.1:4200 for monitoring flow runs.
+
 ### Additional Details
-- instrument_conf.py allows configuration of instrument specific details that may be helpful (currently very limited):
-    - `DEFAULT_BROWSE_DIR` will set the default directory
-    - `IS_SESSION` should be set to True if you have a folder of data you want to upload as a dataset. This will create a `parent dataset` for the session as well as datasets for each qualifying file within the directory. The individual file based datasets will be linked to the `parent dataset` as children.
-    - `INSTRUMENTS` is a list of the instruments that will appear as choices in a dropdown in the UI
-    - `DEFAULT_INSTRUMENT` will be the pre-selected instrument value.
+- instrument_conf.py allows configuration of instrument specific details that may be helpful:
+    - `DEFAULT_BROWSE_DIR` will set the default directory for the file/folder picker.
+    - `IS_SESSION` controls the upload mode (applies to the whole app):
+        - `True` — the picker selects a **folder**. A `parent dataset` is created for the session and one child dataset is created per qualifying file within the directory, each linked to the parent.
+        - `False` — the picker selects **one or more files** (cmd/ctrl/shift-click to multi-select). Each file becomes its own standalone dataset; no parent session is created.
+    - `INSTRUMENTS` is a list of the instruments that will appear as choices in a dropdown in the UI.
+    - `DEFAULT_INSTRUMENT_NAME` will be the pre-selected instrument value.
+    - `INSTRUMENT_FLOWS` maps a session-mode instrument to the Prefect deployment used to upload its sessions (format `flow-name/deployment-name`). Only consulted when `IS_SESSION = True`; file-mode uploads always use the generic `upload-dataset` / `multi-file-upload` deployments.
+    - `POST_PROCESSING_REQUESTS` maps an instrument name to a list of post-processing requests to run on each dataset after its files land (e.g. `{"insitu_pl": ["insitu_aggregation"]}`). Each name maps to the corresponding `client.datasets.request_<name>` call; instruments not listed get no post-processing.
+    - `CHAIN_POST_PROCESSING` controls how an instrument's post-processing requests run: `True` runs them sequentially, where each depends on the previous succeeding (a failure halts the rest); `False` requests them all in parallel.
+    - `ACCEPTABLE_FILE_TYPES` is the set of file extensions eligible for upload in session mode.
     - `PRINT_BARCODE_ENABLED` can be set to True or False. If True a button will display in the UI to allow the user to print the barcode for the sample. Barcode formatting and printer settings are currently not configurable. The app will expect a Brother pt-d610bt label printer to be connected to the printer with 0.94" tape. This setup is also currently limited to windows os. 
 - To prevent accidental uploads of system-level directories, the selected folder must be at least 3 levels deep from the filesystem root (e.g. D:\Users\data\session). 
 

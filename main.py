@@ -1,7 +1,10 @@
 """
 Crucible Upload UI — Flask backend
 """
+import ast
+import importlib
 import logging
+import os
 import queue
 import threading
 import webbrowser
@@ -11,7 +14,7 @@ from tkinter import filedialog
 from flask import Flask, jsonify, render_template, request
 
 import prefect_backend as backend
-from instrument_conf import DEFAULT_BROWSE_DIR, IS_SESSION, DEFAULT_INSTRUMENT_NAME, PRINT_BARCODE_ENABLED, INSTRUMENTS, INSTRUMENT_FLOWS
+import instrument_conf as conf
 from ai_services import voice_bp, extract_keywords
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(funcName)s: %(message)s")
@@ -27,6 +30,9 @@ _tk_root.wm_attributes("-topmost", 1)
 
 _browse_request: queue.Queue = queue.Queue()
 _browse_result: queue.Queue = queue.Queue()
+# Serializes browse() so only one dialog is ever outstanding, preventing a
+# request from consuming a previous request's leftover result.
+_browse_lock = threading.Lock()
 
 
 def _check_browse_queue():
@@ -35,43 +41,194 @@ def _check_browse_queue():
     """
     try:
         _browse_request.get_nowait()
-        if IS_SESSION:
+    except queue.Empty:
+        _tk_root.after(50, _check_browse_queue)
+        return
+    try:
+        # Realize/flush the root so the dialog reliably comes to front on macOS,
+        # where the first invocation otherwise returns empty.
+        _tk_root.update()
+        if conf.IS_SESSION:
             kwargs = {"master": _tk_root, "title": "Select session folder"}
-            if DEFAULT_BROWSE_DIR:
-                kwargs["initialdir"] = DEFAULT_BROWSE_DIR
+            if conf.DEFAULT_BROWSE_DIR:
+                kwargs["initialdir"] = conf.DEFAULT_BROWSE_DIR
             path = filedialog.askdirectory(**kwargs)
             paths = [path] if path else []
         else:
             kwargs = {"master": _tk_root, "title": "Select file(s)"}
-            if DEFAULT_BROWSE_DIR:
-                kwargs["initialdir"] = DEFAULT_BROWSE_DIR
+            if conf.DEFAULT_BROWSE_DIR:
+                kwargs["initialdir"] = conf.DEFAULT_BROWSE_DIR
             paths = list(filedialog.askopenfilenames(**kwargs))
         _browse_result.put(paths)
-    except queue.Empty:
-        pass
-    _tk_root.after(50, _check_browse_queue)
+    finally:
+        _tk_root.after(50, _check_browse_queue)
+
+
+def _drain(q: queue.Queue):
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            return
 
 
 @app.get("/")
 def index():
-    return render_template("index.html", print_barcode_enabled=PRINT_BARCODE_ENABLED)
+    return render_template("index.html", print_barcode_enabled=conf.PRINT_BARCODE_ENABLED)
 
 
 @app.get("/api/instruments")
 def get_instruments():
     return jsonify({
-        "instruments": INSTRUMENTS,
-        "default": DEFAULT_INSTRUMENT_NAME,
-        "is_session": IS_SESSION,
+        "instruments": conf.INSTRUMENTS,
+        "default": conf.DEFAULT_INSTRUMENT_NAME,
+        "is_session": conf.IS_SESSION,
     })
 
 
 @app.get("/api/browse")
 def browse():
-    # Signal the main thread to open the dialog, then wait for the result.
-    _browse_request.put(True)
-    paths = _browse_result.get(timeout=60)
+    # One dialog at a time. Drain any leftover request/result from a prior call
+    # (e.g. a dialog the user abandoned) so we never return a stale selection.
+    with _browse_lock:
+        _drain(_browse_request)
+        _drain(_browse_result)
+        _browse_request.put(True)
+        try:
+            paths = _browse_result.get(timeout=300)
+        except queue.Empty:
+            return jsonify({"paths": [], "error": "Browse dialog timed out"}), 504
     return jsonify({"paths": paths})
+
+
+# -----------------------------------------------------------------------------
+# Instrument config editor
+# -----------------------------------------------------------------------------
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "instrument_conf.py")
+
+# name -> kind. "kind" drives both JSON (de)serialization and validation.
+#   set_str is exposed to the UI as a sorted list and stored as a set literal.
+#   dict_list maps str keys to lists of strings.
+EDITABLE_FIELDS = {
+    "DEFAULT_BROWSE_DIR": "str",
+    "IS_SESSION": "bool",
+    "INSTRUMENTS": "list_str",
+    "DEFAULT_INSTRUMENT_NAME": "str",
+    "INSTRUMENT_FLOWS": "dict_str",
+    "POST_PROCESSING_REQUESTS": "dict_list",
+    "CHAIN_POST_PROCESSING": "bool",
+    "PRINT_BARCODE_ENABLED": "bool",
+    "ACCEPTABLE_FILE_TYPES": "set_str",
+}
+
+
+def _to_json(kind, value):
+    return sorted(value) if kind == "set_str" else value
+
+
+def _coerce(name, kind, value):
+    """Validate/normalize an incoming JSON value into its Python form. Raises ValueError."""
+    if kind == "str":
+        if not isinstance(value, str):
+            raise ValueError(f"{name} must be a string")
+        return value
+    if kind == "bool":
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be true/false")
+        return value
+    if kind in ("list_str", "set_str"):
+        if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+            raise ValueError(f"{name} must be a list of strings")
+        items = [x.strip() for x in value if x.strip()]
+        return set(items) if kind == "set_str" else items
+    if kind == "dict_str":
+        if not isinstance(value, dict) or not all(isinstance(v, str) for v in value.values()):
+            raise ValueError(f"{name} must be a mapping of string to string")
+        return {str(k): v for k, v in value.items()}
+    if kind == "dict_list":
+        if not isinstance(value, dict) or not all(
+            isinstance(v, list) and all(isinstance(x, str) for x in v) for v in value.values()
+        ):
+            raise ValueError(f"{name} must be a mapping of string to list of strings")
+        return {str(k): list(v) for k, v in value.items()}
+    raise ValueError(f"Unknown field kind: {kind}")
+
+
+def _format_literal(value):
+    if isinstance(value, set):
+        return "set()" if not value else "{" + ", ".join(repr(x) for x in sorted(value)) + "}"
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        body = ",\n".join(f"    {k!r}: {v!r}" for k, v in value.items())
+        return "{\n" + body + ",\n}"
+    return repr(value)
+
+
+def _write_config(values):
+    """Rewrite the given top-level assignments in instrument_conf.py in place,
+    preserving comments, the docstring, and any non-edited settings. Reloads the
+    module so the running Flask process picks up the new values immediately."""
+    with open(CONFIG_PATH, "r") as f:
+        src = f.read()
+    lines = src.splitlines(keepends=True)
+
+    # Map each editable name to its source line span via the AST (handles
+    # multi-line dict/set literals that a line regex would miss).
+    spans = {}
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            target = node.targets[0].id
+            if target in values:
+                spans[target] = (node.lineno, node.end_lineno)
+
+    missing = [k for k in values if k not in spans]
+    if missing:
+        raise ValueError(f"Could not locate assignments for: {', '.join(missing)}")
+
+    # Replace bottom-to-top so earlier line numbers stay valid.
+    for name in sorted(values, key=lambda k: spans[k][0], reverse=True):
+        start, end = spans[name]
+        replacement = f"{name} = {_format_literal(values[name])}\n"
+        lines[start - 1:end] = [replacement]
+
+    new_src = "".join(lines)
+    compile(new_src, CONFIG_PATH, "exec")  # reject anything that wouldn't import
+
+    with open(CONFIG_PATH, "w") as f:
+        f.write(new_src)
+    importlib.reload(conf)
+
+
+@app.get("/api/config")
+def get_config():
+    return jsonify({name: _to_json(kind, getattr(conf, name)) for name, kind in EDITABLE_FIELDS.items()})
+
+
+@app.post("/api/config")
+def save_config():
+    data = request.json or {}
+    try:
+        values = {name: _coerce(name, kind, data[name]) for name, kind in EDITABLE_FIELDS.items() if name in data}
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": str(e)}), 400
+    if not values:
+        return jsonify({"error": "No settings provided"}), 400
+
+    # Cross-field check: default instrument must be one of the listed instruments.
+    instruments = values.get("INSTRUMENTS", conf.INSTRUMENTS)
+    default = values.get("DEFAULT_INSTRUMENT_NAME", conf.DEFAULT_INSTRUMENT_NAME)
+    if not instruments:
+        return jsonify({"error": "INSTRUMENTS cannot be empty"}), 400
+    if default and default not in instruments:
+        return jsonify({"error": f"Default instrument '{default}' is not in the instruments list"}), 400
+
+    try:
+        _write_config(values)
+    except Exception as e:
+        backend.logger.error(e)
+        return jsonify({"error": f"Failed to save config: {e}"}), 500
+    return jsonify({"ok": True})
 
 
 @app.post("/api/user/lookup")
@@ -185,7 +342,7 @@ def do_upload():
     kw_list = data.get("keywords", []) or extract_keywords(comments, instrument_name)
 
     # Non-session mode: caller sends a list of file paths; session mode: a single folder path.
-    if IS_SESSION:
+    if conf.IS_SESSION:
         session_folder_path = (data.get("session_folder_path") or "").strip()
         if not session_folder_path:
             return jsonify({"error": "Missing field: session_folder_path"}), 400
@@ -196,10 +353,10 @@ def do_upload():
 
     from prefect.deployments import run_deployment
 
-    if IS_SESSION:
+    if conf.IS_SESSION:
         # Session mode — existing behavior. Create parent session record sync so
         # the UI can show the Crucible link + QR before the flow runs.
-        deployment_name = INSTRUMENT_FLOWS.get(instrument_name)
+        deployment_name = conf.INSTRUMENT_FLOWS.get(instrument_name)
         if not deployment_name:
             return jsonify({"error": f"No upload flow configured for instrument '{instrument_name}'"}), 400
         try:
@@ -250,7 +407,8 @@ def do_upload():
     if len(session_folder_paths) == 1:
         path = session_folder_paths[0]
         try:
-            dsid, _ = backend.resolve_dsid_for_file(path)
+            valid_dsids = backend.existing_dsids(orcid, project_id)
+            dsid, _ = backend.resolve_dsid_for_file(path, valid_dsids)
             flow_run = run_deployment(
                 "upload-dataset/upload-dataset",
                 parameters={

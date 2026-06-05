@@ -227,19 +227,57 @@ def create_session(session_folder_path: str, kw_list: list[str], comments: str, 
     return session_name, use_session_dsid
 
 
-def resolve_dsid_for_file(file_path: str) -> tuple[str, bool]:
-    """Look up a file's SHA256 in Crucible. If a dataset already contains this
-    file, return (existing_dsid, True). Otherwise generate a fresh mfid and
-    return (new_dsid, False). Used by /api/upload for single-file paths so the
-    UI gets a dsid synchronously.
+def existing_dsids(orcid: str, project_id: str) -> set[str]:
+    """Return the set of dataset ids owned by this orcid in this project (one
+    filtered call). Used to scope SHA-based dedup to the right owner+project,
+    since list_files can only filter by sha256_hash.
+    """
+    project_id = project_id.replace('Internal Research (', '').replace(')', '').strip()
+    return {
+        ds['unique_id']
+        for ds in client.datasets.list(owner_orcid=orcid, project_id=project_id, limit=None)
+        if ds.get('unique_id')
+    }
+
+
+def child_dsids(session_dsid: str) -> set[str]:
+    """Return the set of dataset ids that are children of this session. Used to
+    scope SHA-based dedup in session mode to the current session's children, so a
+    file is only deduped against datasets already in this session — not anywhere
+    else in the project.
+    """
+    return {
+        ds['unique_id']
+        for ds in client.datasets.list_children(parent_dataset_id=session_dsid, limit=None)
+        if ds.get('unique_id')
+    }
+
+
+def resolve_dsid_for_file(file_path: str, valid_dsids: set[str] | None = None) -> tuple[str, bool]:
+    """Look up a file's SHA256. If it already lives in one of valid_dsids, return
+    (existing_dsid, True); otherwise generate a fresh mfid and return
+    (new_dsid, False). Pass valid_dsids (from existing_dsids) to scope the match
+    to the right owner+project — list_files can only filter by sha256_hash, and a
+    SHA may exist in other accessible projects we must not reuse.
     """
     import mfid
     sha = _compute_sha256(file_path)
     for f in client.files.list_files(sha256_hash=sha):
-        existing_dsid = f.get('dataset_mfid')
-        if existing_dsid:
-            return existing_dsid, True
+        match_dsid = f.get('dataset_mfid')
+        if match_dsid and (valid_dsids is None or match_dsid in valid_dsids):
+            return match_dsid, True
     return mfid.mfid()[0], False
+
+
+def resolve_dsids_parallel(files: list[str], valid_dsids: set[str] | None = None,
+                           max_workers: int = 8) -> list[tuple[str, bool]]:
+    """resolve_dsid_for_file for each file, in parallel. The lookups are I/O-bound
+    (file read + list_files HTTP call), so a thread pool overlaps them. Results are
+    returned in the same order as files.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(files) or 1)) as ex:
+        return list(ex.map(lambda f: resolve_dsid_for_file(f, valid_dsids), files))
 
 
 @task
@@ -297,13 +335,24 @@ def create_dataset(files: list[str],
     ).items() if v is not None}
     ds = BaseDataset(**ds_kwargs)
     scimd = {'comments': comments} if comments else {}
-    new_ds = client.datasets.create(
-        ds,
-        scientific_metadata=scimd,
-        keywords=kw_list,
-        files_to_upload=files,
-        wait_for_ingestion_response=True,
-    )
+    try:
+        new_ds = client.datasets.create(
+            ds,
+            scientific_metadata=scimd,
+            keywords=kw_list,
+            files_to_upload=files,
+            wait_for_ingestion_response=True,
+        )
+    except Exception:
+        if dsid:
+            try:
+                associated = client.datasets.get_associated_files(dsid)
+                if not any(f.get('storage_path') for f in associated):
+                    client.deletions.request(dsid, reason=f"file upload failed; empty dataset {dsid}")
+                    logger.warning(f"Upload failed; requested deletion of empty dataset {dsid}")
+            except Exception as cleanup_err:
+                logger.error(f"Failed to clean up dataset {dsid}: {cleanup_err}")
+        raise
     new_ds_dsid = new_ds['created_record']['unique_id']
     logger.info(f"{'Resumed' if dsid else 'Created'} dataset {new_ds_dsid} for {', '.join(Path(f).name for f in files)}")
     return new_ds_dsid
@@ -389,7 +438,6 @@ def session_upload(file: str, instrument_name: str, project_id: str, orcid: str,
                        kw_list: list[str] = [], comments: str | None = None) -> str:
     import time
     import os
-    import mfid
     import requests as req
     from prefect.deployments import run_deployment
     logger = get_run_logger()
@@ -410,20 +458,20 @@ def session_upload(file: str, instrument_name: str, project_id: str, orcid: str,
     session_files = identify_session_files(session_folder_path)
     logger.info(f'{session_files=}')
 
-    sha_to_dsid = build_existing_sha_map(orcid, project_id)
-    logger.info(f"Found {len(sha_to_dsid)} existing files for user+project")
+    valid_dsids = child_dsids(session_dsid)
+    logger.info(f"Found {len(valid_dsids)} existing datasets in this session")
+
+    resolved = resolve_dsids_parallel(session_files, valid_dsids)
 
     # Submit all child flows in parallel (timeout=0 returns immediately)
     child_runs = []
-    for f in session_files:
+    for f, (dsid, existed) in zip(session_files, resolved):
         time.sleep(0.3)
         dsfiles = [f]
         if f.endswith('ser'):
             dsfiles.append(get_emi_file_name(f))
 
-        sha = _compute_sha256(f)
-        dsid = sha_to_dsid.get(sha) or mfid.mfid()[0]
-        logger.info(f"{Path(f).name}: {'reusing existing' if sha in sha_to_dsid else 'new'} dsid {dsid}")
+        logger.info(f"{Path(f).name}: {'reusing existing' if existed else 'new'} dsid {dsid}")
 
         run = run_deployment(
             "upload-dataset/upload-dataset",
@@ -475,26 +523,10 @@ def session_upload(file: str, instrument_name: str, project_id: str, orcid: str,
     return session_dsid
 
 
-@task
-def build_existing_sha_map(orcid: str, project_id: str) -> dict[str, str]:
-    """Pull every file for this user+project once and return a {sha256: dsid} map.
-    Used by multi_file_upload to dedup against existing datasets before generating
-    fresh mfids — files whose SHA is already in the map reuse the existing dsid.
-    """
-    project_id = project_id.replace('Internal Research (', '').replace(')', '').strip()
-    sha_to_dsid: dict[str, str] = {}
-    for f in client.files.list_files(owner_orcid=orcid, project_id=project_id):
-        sha = f.get('sha256_hash')
-        dsid = f.get('dataset_mfid')
-        if sha and dsid:
-            sha_to_dsid.setdefault(sha, dsid)
-    return sha_to_dsid
-
-
-# flow to upload N standalone files, each as its own dataset. SHA dedup happens
-# once up-front against all of the user's existing files in this project; then
-# one upload-dataset sub-flow is fired per file with either the existing dsid
-# (already uploaded — sub-flow no-ops) or a fresh mfid-generated dsid.
+# flow to upload N standalone files, each as its own dataset. The project's
+# existing dataset ids are fetched once; then per file a SHA lookup reuses the
+# existing dsid (sub-flow no-ops) or a fresh mfid is generated, and one
+# upload-dataset sub-flow is fired.
 @flow(flow_run_name=_run_name("multi-file-upload"))
 def multi_file_upload(files: list[str],
                       instrument_name: str,
@@ -504,23 +536,17 @@ def multi_file_upload(files: list[str],
                       kw_list: list[str] = [],
                       comments: str | None = None) -> list[str]:
     import time
-    import mfid
     from prefect.deployments import run_deployment
     logger = get_run_logger()
 
-    sha_to_dsid = build_existing_sha_map(orcid, project_id)
-    logger.info(f"Found {len(sha_to_dsid)} existing files for user+project")
+    valid_dsids = existing_dsids(orcid, project_id)
+    logger.info(f"Found {len(valid_dsids)} existing datasets for user+project")
+
+    resolved = resolve_dsids_parallel(files, valid_dsids)
 
     submitted = []
-    for f in files:
-        sha = _compute_sha256(f)
-        existing_dsid = sha_to_dsid.get(sha)
-        if existing_dsid:
-            dsid = existing_dsid
-            logger.info(f"{Path(f).name}: SHA matches existing dataset {dsid}; sub-flow will resume/no-op")
-        else:
-            dsid = mfid.mfid()[0]
-            logger.info(f"{Path(f).name}: new dataset, assigned dsid {dsid}")
+    for f, (dsid, existed) in zip(files, resolved):
+        logger.info(f"{Path(f).name}: {'reusing existing' if existed else 'new'} dsid {dsid}")
 
         time.sleep(0.3)
         run = run_deployment(
