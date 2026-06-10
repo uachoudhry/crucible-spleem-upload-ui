@@ -447,7 +447,7 @@ def session_upload(file: str, instrument_name: str, project_id: str, orcid: str,
 
     check_session_depth(session_folder_path)
 
-    copy_all_files_to_gdrive(session_folder_path, instrument_name)
+    # copy_all_files_to_gdrive(session_folder_path, instrument_name)  # not used for SPLEEM
 
     session_name, session_dsid = create_session(
         session_folder_path, kw_list, comments or "",
