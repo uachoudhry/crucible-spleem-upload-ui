@@ -9,7 +9,7 @@ DEFAULT_INSTRUMENT_NAME = 'qspleem_microscope'
 # Only consulted in session mode (IS_SESSION = True); non-session uploads always use
 # the generic upload-dataset / multi-file-upload deployments.
 INSTRUMENT_FLOWS = {
-    'qspleem_microscope': 'tem-session-upload/spleem-session-upload',  # flow name matches upstream tem_session_upload
+    'qspleem_microscope': 'session-upload/session-upload',  # flow name matches upstream tem_session_upload
 }
 
 # Post-processing requested on each dataset after its files land, keyed by instrument.
