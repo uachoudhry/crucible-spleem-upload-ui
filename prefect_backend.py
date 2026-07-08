@@ -367,6 +367,35 @@ def link_dataset_to_session(new_ds_dsid: str, session_dsid: str | None = None):
     return None
 
 
+def link_arres_image_children(session_dsid: str):
+    """Link each ARRES image-companion dataset as a child of its base ARRES
+    dataset. Additive: the companions remain flat children of the session too.
+
+    Runs after all per-file child flows complete, so every child's dataset_name
+    (= its filename, set during ingestion) is populated and the base<->image
+    match is deterministic regardless of upload order.
+    """
+    try:
+        children = client.datasets.list_children(session_dsid)
+    except Exception as e:
+        logger.error(f"Could not list session children for ARRES linking: {e}")
+        return
+    by_name = {c.get('dataset_name'): c['unique_id'] for c in children if c.get('dataset_name')}
+    for name, dsid in by_name.items():
+        m = re.match(r'(.+_ARRES_(?:EK|MM))_images(?:_\d+)?\.h5$', name)
+        if not m:
+            continue
+        base_dsid = by_name.get(m.group(1) + '.h5')
+        if not base_dsid:
+            logger.warning(f"No base dataset for ARRES image companion {name}; leaving it under the session only")
+            continue
+        try:
+            client.datasets.link_parent_child(parent_dataset_id=base_dsid, child_dataset_id=dsid)
+            logger.info(f"Linked ARRES image companion {name} -> {m.group(1)}.h5")
+        except Exception as e:
+            logger.warning(f"Failed to link ARRES image companion {name}: {e}")
+
+
 @task(retries=3, retry_delay_seconds=5)
 def link_dataset_and_sample(new_ds_dsid: str, sample_unique_id: str | None = None):
     if sample_unique_id is not None:
@@ -520,6 +549,8 @@ def session_upload(file: str, instrument_name: str, project_id: str, orcid: str,
 
     if failed:
         logger.error(f"{len(failed)} child flow(s) failed. Retry them from the Prefect UI.")
+
+    link_arres_image_children(session_dsid)
 
     return session_dsid
 
