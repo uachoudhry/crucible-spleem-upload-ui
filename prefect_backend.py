@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 import subprocess as sp
 from crucible import CrucibleClient
-from crucible.models import BaseDataset
+from crucible.models import Dataset
 import logging
 from prefect import flow, task
 from prefect.logging import get_run_logger
@@ -209,7 +209,7 @@ def create_session(session_folder_path: str, kw_list: list[str], comments: str, 
     if session_dsid is not None and session_dsid != "new":
         use_session_dsid = session_dsid
     else:
-        session_ds = BaseDataset(dataset_name=dsname,
+        session_ds = Dataset(dataset_name=dsname,
                                 owner_orcid=orcid,
                                 project_id=project_id,
                                 instrument_name=instrument_name,
@@ -334,7 +334,7 @@ def create_dataset(files: list[str],
         instrument_name=instrument_name,
         session_name=session_name,
     ).items() if v is not None}
-    ds = BaseDataset(**ds_kwargs)
+    ds = Dataset(**ds_kwargs)
     scimd = {'comments': comments} if comments else {}
     try:
         new_ds = client.datasets.create(

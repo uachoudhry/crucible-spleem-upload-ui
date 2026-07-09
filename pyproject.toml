@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "flask>=3.0",
-    "nano-crucible==2.1.2",
+    "nano-crucible==3.0.1",
     "pillow>=12.1.1",
     "prefect>=3.6.25",
     "pytest>=9.0.3",
