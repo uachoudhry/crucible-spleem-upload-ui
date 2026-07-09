@@ -258,12 +258,12 @@ def resolve_dsid_for_file(file_path: str, valid_dsids: set[str] | None = None) -
     """Look up a file's SHA256. If it already lives in one of valid_dsids, return
     (existing_dsid, True); otherwise generate a fresh mfid and return
     (new_dsid, False). Pass valid_dsids (from existing_dsids) to scope the match
-    to the right owner+project — list_files can only filter by sha256_hash, and a
+    to the right owner+project — files.list can only filter by sha256_hash, and a
     SHA may exist in other accessible projects we must not reuse.
     """
     import mfid
     sha = _compute_sha256(file_path)
-    for f in client.files.list_files(sha256_hash=sha):
+    for f in client.files.list(sha256_hash=sha):
         match_dsid = f.get('dataset_mfid')
         if match_dsid and (valid_dsids is None or match_dsid in valid_dsids):
             return match_dsid, True
@@ -347,7 +347,7 @@ def create_dataset(files: list[str],
     except Exception:
         if dsid:
             try:
-                associated = client.datasets.get_associated_files(dsid)
+                associated = client.datasets.list_files(dsid)
                 if not any(f.get('storage_path') for f in associated):
                     client.deletions.request(dsid, reason=f"file upload failed; empty dataset {dsid}")
                     logger.warning(f"Upload failed; requested deletion of empty dataset {dsid}")
