@@ -262,6 +262,13 @@ def resolve_dsid_for_file(file_path: str, valid_dsids: set[str] | None = None) -
     SHA may exist in other accessible projects we must not reuse.
     """
     import mfid
+    # Empty (but not None) valid_dsids means there are no datasets to dedup
+    # against (e.g. a fresh session), so the loop below could only ever fall
+    # through to a fresh mfid. Short-circuit to skip hashing the file — which for
+    # a large session avoids reading hundreds of GB just to discard the result.
+    # (None keeps its "match anywhere" meaning; a non-empty set still dedups.)
+    if valid_dsids is not None and not valid_dsids:
+        return mfid.mfid()[0], False
     sha = _compute_sha256(file_path)
     for f in client.files.list(sha256_hash=sha):
         match_dsid = f.get('dataset_mfid')
@@ -277,6 +284,12 @@ def resolve_dsids_parallel(files: list[str], valid_dsids: set[str] | None = None
     returned in the same order as files.
     """
     from concurrent.futures import ThreadPoolExecutor
+    if valid_dsids:
+        logger.info(f"Dedup: hashing {len(files)} file(s) against "
+                    f"{len(valid_dsids)} existing dataset(s) — this reads every file "
+                    f"and can take a while for large sessions.")
+    else:
+        logger.info(f"Fresh target ({len(files)} file(s)): skipping SHA dedup pre-pass.")
     with ThreadPoolExecutor(max_workers=min(max_workers, len(files) or 1)) as ex:
         return list(ex.map(lambda f: resolve_dsid_for_file(f, valid_dsids), files))
 
