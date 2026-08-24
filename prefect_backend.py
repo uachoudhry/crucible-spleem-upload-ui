@@ -349,6 +349,30 @@ def create_dataset(files: list[str],
     ).items() if v is not None}
     ds = Dataset(**ds_kwargs)
     scimd = {'comments': comments} if comments else {}
+
+    # A caller-supplied dsid can already be taken: retrying a child flow run
+    # replays the SAME dsid parameter, and the urllib3 adapter retries POSTs, so
+    # a lost response can create the dataset twice. Either way we get 409 and the
+    # transfer never starts. If the sitting dataset holds no files it is a dead
+    # shell from a previous failure -- nothing to preserve, so drop the id and
+    # let the server mint a fresh one rather than failing the whole upload.
+    if dsid:
+        try:
+            existing = client.datasets.list_files(dsid)
+        except Exception:
+            existing = None       # dsid not on the server -> normal create below
+        if existing is not None:
+            want = {Path(f).name for f in files}
+            have = {f.get('filename') for f in existing if f.get('storage_path')}
+            if want <= have:
+                logger.info(f"dataset {dsid} already holds {sorted(want)}; nothing to do")
+                return dsid       # genuine no-op, as the session flow intends
+            logger.warning(f"dsid {dsid} exists but is missing {sorted(want - have)} "
+                           f"(stale shell from a previous failure); using a fresh id")
+            ds_kwargs.pop('unique_id', None)
+            ds = Dataset(**ds_kwargs)
+            dsid = None
+
     try:
         new_ds = client.datasets.create(
             ds,
@@ -422,6 +446,57 @@ def request_post_processing(name: str, new_ds_dsid: str):
     return getattr(client.datasets, f"request_{name}")(new_ds_dsid)
 
 
+# --- upload concurrency -------------------------------------------------
+# Small files are latency-bound: running many at once is a clear win. Large
+# files are bandwidth-bound, and running 9 of them at once just splits one
+# uplink 9 ways -- each stream crawls, every transfer stays open for ~14 min,
+# and a single stalled socket write (api_core gives up after 120 s) throws all
+# of it away. Same total throughput either way; fewer concurrent large streams
+# simply means each finishes sooner, so the window in which a stall can destroy
+# the whole transfer is much smaller.
+#
+# So: only large uploads take a slot in LARGE_UPLOAD_LIMIT. Small ones stay
+# unthrottled, bounded by serve(limit=...) as before.
+LARGE_UPLOAD_BYTES = 1 * 1024 ** 3      # >= 1 GiB counts as bandwidth-bound
+LARGE_UPLOAD_LIMIT = 'crucible-large-upload'
+LARGE_UPLOAD_SLOTS = 3                  # concurrent large transfers
+
+
+def ensure_upload_concurrency_limit(name: str = LARGE_UPLOAD_LIMIT,
+                                    slots: int = LARGE_UPLOAD_SLOTS) -> None:
+    """Create the global concurrency limit if absent. Idempotent; never fatal.
+
+    The limit is server-side state, so it can also be retuned live via the API
+    without editing or restarting anything.
+    """
+    import os as _os
+    import requests as _requests
+    api = _os.environ.get('PREFECT_API_URL', 'http://127.0.0.1:4200/api').rstrip('/')
+    try:
+        r = _requests.post(f'{api}/v2/concurrency_limits/filter',
+                           json={'limit': 100}, timeout=10)
+        r.raise_for_status()
+        if any(x.get('name') == name for x in r.json()):
+            return
+        _requests.post(f'{api}/v2/concurrency_limits/',
+                       json={'name': name, 'limit': slots, 'active': True},
+                       timeout=10).raise_for_status()
+        logger.info(f"Created concurrency limit {name!r} = {slots}")
+    except Exception as e:                                    # noqa: BLE001
+        logger.warning(f"Could not ensure concurrency limit {name!r}: {e}")
+
+
+def _is_large(files: list) -> bool:
+    import os as _os
+    total = 0
+    for f in files:
+        try:
+            total += _os.path.getsize(f)
+        except OSError:
+            pass
+    return total >= LARGE_UPLOAD_BYTES
+
+
 def _run_name(prefix):
     def generate():
         from prefect.runtime import flow_run
@@ -450,14 +525,17 @@ def upload_dataset(files: list,
                    comments: str | None = None) -> str:
     from instrument_conf import POST_PROCESSING_REQUESTS, CHAIN_POST_PROCESSING
 
-    new_ds_dsid = create_dataset(files=files,
-                                 instrument_name=instrument_name,
-                                 project_id=project_id,
-                                 orcid=orcid,
-                                 session_name=session_name,
-                                 dsid=dsid,
-                                 kw_list=kw_list,
-                                 comments=comments)
+    _kw = dict(files=files, instrument_name=instrument_name, project_id=project_id,
+               orcid=orcid, session_name=session_name, dsid=dsid,
+               kw_list=kw_list, comments=comments)
+    if _is_large(files):
+        # queue behind any other large transfers so each gets a real share of
+        # the uplink and finishes before a stalled write can time it out
+        from prefect.concurrency.sync import concurrency
+        with concurrency(LARGE_UPLOAD_LIMIT):
+            new_ds_dsid = create_dataset(**_kw)
+    else:
+        new_ds_dsid = create_dataset(**_kw)
 
     link_dataset_to_session(new_ds_dsid, session_dsid)
     link_dataset_and_sample(new_ds_dsid, sample_unique_id)
